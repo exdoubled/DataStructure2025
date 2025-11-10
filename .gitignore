@@ -1,0 +1,17 @@
+// 题目
+*.pdf
+
+// vscode
+.vscode/
+
+// 查询文件
+query.txt
+
+// 答案文件
+ans.txt
+
+// 可执行文件
+*.exe
+
+// 配置文件
+Config.h
