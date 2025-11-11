@@ -14,7 +14,7 @@
 */
 /*
 常用命令示例：
-./checker.exe 2 --ans ".\ans.txt" --algo=solution --first=10
+./checker.exe 2 --ans "./anstest.txt" --algo=solution --first=10
 ./checker.exe 0 --ans="./ans.txt" --algo=solution --first=100
 ./checker.exe 1 --ans="./ans.txt" --algo=solution --first=100
 ./checker.exe 0 --ans="./ans.txt" --algo=solution
@@ -60,7 +60,7 @@ static void read_data(int &dataset_case) {
         dimensions_ = 100;
     } else if (dataset_case == 1) {
         filePath = SIFTPATH;
-        pointsnum = 10000000;
+        pointsnum = 1000000;
         dimensions_ = 128;
     } else if (dataset_case == 2) {
         filePath = TESTPATH; // small test dataset
@@ -172,6 +172,7 @@ struct GroundTruth {
     int k = 0;
     size_t num = 0;
     std::vector<std::vector<int>> indices; // size=num, each length>=k
+    int dataset_case_in_ans = -1;          // parsed from header if present
 };
 
 // 解析答案文件
@@ -181,17 +182,22 @@ static bool parse_ans(const std::string &path, GroundTruth &gt) {
     std::string line;
     bool header_ok = false;
     while (std::getline(ifs, line)) {
+        if (line.rfind("Dataset case:", 0) == 0) {
+            // format: Dataset case: <int>
+            std::istringstream ds(line.substr(13));
+            int dc; if (ds >> dc) gt.dataset_case_in_ans = dc;
+        }
         if (line.rfind("Results (top-", 0) == 0) {
-            // format: Results (top-<k> indices per query, space-separated):
             size_t p1 = line.find("top-");
             size_t p2 = line.find(" ", p1 + 4);
             if (p1 != std::string::npos) {
                 std::string ks = line.substr(p1 + 4, p2 - (p1 + 4));
                 gt.k = std::max(0, std::atoi(ks.c_str()));
                 header_ok = true;
-                break;
             }
+            break;
         }
+        if (ifs.tellg() == std::streampos(-1)) break; // EOF
     }
     if (!header_ok) return false;
 
@@ -215,6 +221,7 @@ int main(int argc, char** argv) {
     std::string ans_path = ANSFILEPATH;
     size_t firstN = 0; // 0 = evaluate all
     std::string algo = "solution"; // solution | brute
+    std::string query_override;     // optional custom query file path
 
     // Parse args
     auto is_unsigned_integer = [](const std::string &s) -> bool {
@@ -244,6 +251,10 @@ int main(int argc, char** argv) {
             algo = argv[++i];
         } else if (a.rfind("--algo=", 0) == 0) {
             algo = a.substr(7);
+        } else if (a == "--query" && i + 1 < argc) {
+            query_override = argv[++i];
+        } else if (a.rfind("--query=", 0) == 0) {
+            query_override = a.substr(8);
         }
     }
 
@@ -253,7 +264,16 @@ int main(int argc, char** argv) {
         std::cerr << "Failed to parse ground-truth from: " << ans_path << std::endl;
         return 1;
     }
-    std::cerr << "Loaded ground-truth: num=" << gt.num << " k=" << gt.k << " from " << ans_path << std::endl;
+    std::cerr << "Loaded ground-truth: num=" << gt.num << " k=" << gt.k << " from " << ans_path;
+    if (gt.dataset_case_in_ans != -1) std::cerr << " (dataset_case=" << gt.dataset_case_in_ans << ")";
+    std::cerr << std::endl;
+    if (gt.dataset_case_in_ans != -1 && gt.dataset_case_in_ans != dataset_case) {
+        std::cerr << "[ERROR] Dataset case mismatch: ans file has dataset_case=" << gt.dataset_case_in_ans
+                  << ", but you specified " << dataset_case << "." << std::endl;
+        std::cerr << "        Please run checker with dataset_case=" << gt.dataset_case_in_ans
+                  << " or regenerate the ans file for dataset_case=" << dataset_case << "." << std::endl;
+        return 1;
+    }
 
     read_data(dataset_case);
     int dim = dimensions_;
@@ -279,7 +299,26 @@ int main(int argc, char** argv) {
 
     // Load queries
     std::vector<std::vector<float>> queries;
-    size_t qloaded = load_queries_from_txt(filePath, dim, gt.num, queries);
+    size_t qloaded = 0;
+    if (!query_override.empty()) {
+        std::ifstream qf(query_override);
+        if (!qf.is_open()) {
+            std::cerr << "[ERROR] Cannot open query file: " << query_override << std::endl;
+            return 1;
+        }
+        std::string qline;
+        while (queries.size() < gt.num && std::getline(qf, qline)) {
+            if (qline.empty()) continue;
+            std::istringstream ss(qline);
+            std::vector<float> row; float v;
+            while (row.size() < (size_t)dim && ss >> v) row.push_back(v);
+            if (row.size() == (size_t)dim) queries.push_back(std::move(row));
+        }
+        qloaded = queries.size();
+        std::cerr << "Loaded queries from override file: " << query_override << ", count=" << qloaded << std::endl;
+    } else {
+        qloaded = load_queries_from_txt(filePath, dim, gt.num, queries);
+    }
     if (qloaded < gt.num) {
         std::cerr << "Warning: queries loaded (" << qloaded << ") < ground-truth num (" << gt.num << ")" << std::endl;
     }

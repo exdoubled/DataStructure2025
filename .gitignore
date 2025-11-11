@@ -5,10 +5,11 @@
 .vscode/
 
 // 查询文件
-query.txt
+query*.txt
 
 // 答案文件
-ans.txt
+ans*.txt
+
 
 // 可执行文件
 *.exe

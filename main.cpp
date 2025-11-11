@@ -62,7 +62,7 @@ void read_data(int &dataset_case) {
     }
     else if (dataset_case == 1) {
         filePath = SIFTPATH;
-        pointsnum = 10000000;
+        pointsnum = 1000000;
         dimensions_ = 128;
     }
     else if (dataset_case == 2) {
