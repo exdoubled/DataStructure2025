@@ -16,3 +16,8 @@ ans*.txt
 
 // 配置文件
 Config.h
+
+// 参考文件
+cpp/
+hnswlib/
+

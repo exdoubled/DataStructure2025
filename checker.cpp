@@ -34,12 +34,44 @@
 #include <string>
 #include <unordered_set>
 #include <vector>
+#include <mutex>
 
 #include "MySolution.h"
 #include "Config.h"
 #include "Brute.h"
 
+// MinGW 8.1 (win32 线程模型) 可能缺失 _GLIBCXX_HAS_GTHREAD，导致 std::mutex 未定义。
+// 如果检测到该宏缺失，提供一个空实现，只用于单线程调用，避免修改 hnswlib 其它逻辑。
+#if !defined(_GLIBCXX_HAS_GTHREAD)
+namespace std {
+    class mutex { public: void lock() {} void unlock() {} };
+}
+#endif
+
+#include "hnswlib/hnswlib.h"
+
 // 见 Config.h
+// ---- Runtime knobs (easy to tweak) ----
+// 是否打印进度（1 打印 / 0 不打印）
+#define PRINT_PROGRESS 1
+// 进度打印的步长（每处理多少条查询打印一次）
+#define PROGRESS_EVERY 200
+// 只处理前 N 条查询（0 表示不限制，处理全部）
+#define RUN_FIRST_N 0
+
+// ---- Unified progress bar macros ----
+#define ENABLE_PROGRESS 1
+#define PROGRESS_BAR_WIDTH 30
+#define PROGRESS_STEP_LOAD 200000
+#define PROGRESS_STEP_SEARCH 200
+#define PROGRESS_STEP_WRITE 1000
+#define PROGRESS_STEP_EVAL 500
+static void progress_bar(const char* stage, size_t current, size_t total,
+                         std::chrono::high_resolution_clock::time_point start_tp);
+
+// 前置声明：进度条函数
+static void print_progress_bar(const char* stage, size_t current, size_t total,
+                               std::chrono::high_resolution_clock::time_point start_tp);
 
 static std::string filePath;
 static size_t pointsnum = 0;
@@ -83,6 +115,7 @@ static size_t load_flat_vectors_from_txt(const std::string &path, int dim, size_
 
     std::string line;
     size_t read = 0;
+    auto start_tp = std::chrono::high_resolution_clock::now();
     while (read < max_count && std::getline(ifs, line)) {
         if (line.empty()) continue;
         std::istringstream ss(line);
@@ -92,7 +125,11 @@ static size_t load_flat_vectors_from_txt(const std::string &path, int dim, size_
         if (row.size() < (size_t)dim) continue; // skip incomplete rows
         out_flat.insert(out_flat.end(), row.begin(), row.end());
         ++read;
+        if (ENABLE_PROGRESS && (read % PROGRESS_STEP_LOAD == 0 || read == max_count)) {
+            progress_bar("Loading base", read, max_count, start_tp);
+        }
     }
+    if (ENABLE_PROGRESS) progress_bar("Loading base", read, read, start_tp);
     return read;
 }
 
@@ -109,6 +146,7 @@ static size_t load_queries_from_txt(const std::string &base_path, int dim, size_
             if (file_exists(cand)) {
                 std::ifstream ifs(cand);
                 std::string line;
+                auto start_tp = std::chrono::high_resolution_clock::now();
                 while (out_queries.size() < max_queries && std::getline(ifs, line)) {
                     if (line.empty()) continue;
                     std::istringstream ss(line);
@@ -116,7 +154,13 @@ static size_t load_queries_from_txt(const std::string &base_path, int dim, size_
                     float v;
                     while (row.size() < (size_t)dim && ss >> v) row.push_back(v);
                     if (row.size() == (size_t)dim) out_queries.push_back(std::move(row));
+                    if (ENABLE_PROGRESS) {
+                        size_t cur = out_queries.size();
+                        if (cur % PROGRESS_STEP_LOAD == 0 || cur == max_queries)
+                            progress_bar("Loading queries", cur, max_queries, start_tp);
+                    }
                 }
+                if (ENABLE_PROGRESS) progress_bar("Loading queries", out_queries.size(), out_queries.size(), start_tp);
                 return out_queries.size();
             }
         }
@@ -128,6 +172,7 @@ static size_t load_queries_from_txt(const std::string &base_path, int dim, size_
             if (file_exists(cand)) {
                 std::ifstream ifs(cand);
                 std::string line;
+                auto start_tp = std::chrono::high_resolution_clock::now();
                 while (out_queries.size() < max_queries && std::getline(ifs, line)) {
                     if (line.empty()) continue;
                     std::istringstream ss(line);
@@ -136,6 +181,7 @@ static size_t load_queries_from_txt(const std::string &base_path, int dim, size_
                     while (row.size() < (size_t)dim && ss >> v) row.push_back(v);
                     if (row.size() == (size_t)dim) out_queries.push_back(std::move(row));
                 }
+                if (ENABLE_PROGRESS) progress_bar("Loading queries", out_queries.size(), out_queries.size(), start_tp);
                 return out_queries.size();
             }
         }
@@ -151,6 +197,7 @@ static size_t load_queries_from_txt(const std::string &base_path, int dim, size_
             if (file_exists(cand)) {
                 std::ifstream ifs(cand);
                 std::string line;
+                auto start_tp = std::chrono::high_resolution_clock::now();
                 while (out_queries.size() < max_queries && std::getline(ifs, line)) {
                     if (line.empty()) continue;
                     std::istringstream ss(line);
@@ -159,6 +206,7 @@ static size_t load_queries_from_txt(const std::string &base_path, int dim, size_
                     while (row.size() < (size_t)dim && ss >> v) row.push_back(v);
                     if (row.size() == (size_t)dim) out_queries.push_back(std::move(row));
                 }
+                if (ENABLE_PROGRESS) progress_bar("Loading queries", out_queries.size(), out_queries.size(), start_tp);
                 return out_queries.size();
             }
         }
@@ -213,14 +261,37 @@ static bool parse_ans(const std::string &path, GroundTruth &gt) {
         }
     }
     gt.num = gt.indices.size();
+    if (ENABLE_PROGRESS) {
+        std::cerr << "[Progress] Parsed ground-truth queries: " << gt.num << "\n";
+    }
     return gt.num > 0 && gt.k > 0;
+}
+
+static void progress_bar(const char* stage, size_t current, size_t total,
+                         std::chrono::high_resolution_clock::time_point start_tp) {
+#if ENABLE_PROGRESS
+    if (total == 0) return;
+    double ratio = (double)current / (double)total;
+    int filled = (int)std::round(ratio * PROGRESS_BAR_WIDTH);
+    double elapsed = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start_tp).count();
+    double per = elapsed / std::max<size_t>(1, current);
+    double eta = per * (current < total ? (total - current) : 0);
+    std::ostringstream bar;
+    bar << '['; for (int i = 0; i < PROGRESS_BAR_WIDTH; ++i) bar << (i < filled ? '#' : '.'); bar << ']';
+    std::cout << "\r" << stage << ' ' << bar.str()
+              << ' ' << current << '/' << total
+              << " (" << std::fixed << std::setprecision(1) << ratio * 100.0 << "%)"
+              << " elapsed:" << std::setprecision(2) << elapsed << "s"
+              << " ETA:" << std::setprecision(2) << eta << "s" << std::flush;
+    if (current == total) std::cout << "\n";
+#endif
 }
 
 int main(int argc, char** argv) {
     int dataset_case = 0;
     std::string ans_path = ANSFILEPATH;
     size_t firstN = 0; // 0 = evaluate all
-    std::string algo = "solution"; // solution | brute
+    std::string algo = "solution"; // solution | brute | hnsw
     std::string query_override;     // optional custom query file path
 
     // Parse args
@@ -292,6 +363,7 @@ int main(int argc, char** argv) {
         std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
         for (size_t i = 0; i < N; ++i)
             for (int j = 0; j < dim; ++j) base_data[i * dim + j] = dist(rng);
+        loaded = N; // ensure subsequent logic (e.g., HNSW max_elements & addPoint loop) uses correct count
         std::cerr << "Using synthetic base with N=" << N << " dim=" << dim << std::endl;
     } else {
         std::cerr << "Loaded base: N=" << loaded << " dim=" << dim << std::endl;
@@ -331,6 +403,7 @@ int main(int argc, char** argv) {
     std::vector<std::vector<int>> pred(num_to_eval, std::vector<int>(pred_k, -1));
     double build_ms = 0.0, search_ms = 0.0, avg_ms = 0.0;
 
+    auto search_start_tp = std::chrono::high_resolution_clock::now();
     if (algo == "solution") {
         Solution sol;
         auto t_build_start = std::chrono::high_resolution_clock::now();
@@ -340,11 +413,49 @@ int main(int argc, char** argv) {
         auto t0 = std::chrono::high_resolution_clock::now();
         for (size_t i = 0; i < num_to_eval; ++i) {
             sol.search(queries[i], pred[i].data());
+            if (ENABLE_PROGRESS && ((i + 1) % PROGRESS_STEP_SEARCH == 0 || i + 1 == num_to_eval))
+                progress_bar("Searching", i + 1, num_to_eval, t0);
         }
         auto t1 = std::chrono::high_resolution_clock::now();
         build_ms = std::chrono::duration<double>(t_build_end - t_build_start).count() * 1000.0;
         search_ms = std::chrono::duration<double>(t1 - t0).count() * 1000.0;
-    } else { // algo == "brute"
+    } else if (algo == "hnsw") {
+        // 使用 hnswlib 进行 ANN 搜索，参考根目录 cpp/example 的调用模式
+        hnswlib::L2Space space(dim);
+        const size_t max_elements = base_data.size() / (size_t)dim; // 与已加载的 base 数据一致
+
+        auto t_build_start = std::chrono::high_resolution_clock::now();
+        hnswlib::HierarchicalNSW<float> alg_hnsw(&space, max_elements, 16, 200, 42);
+        for (size_t i = 0; i < max_elements; ++i) {
+            alg_hnsw.addPoint(base_data.data() + i * dim, (hnswlib::labeltype)i);
+        }
+        // 提高 ef 以提升 recall（示例中常用 100~200）
+        alg_hnsw.setEf(200);
+        auto t_build_end = std::chrono::high_resolution_clock::now();
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (size_t qi = 0; qi < num_to_eval; ++qi) {
+            auto result_queue = alg_hnsw.searchKnn(queries[qi].data(), pred_k);
+            // priority_queue 顶端为最大距离，弹出收集后反转得到从近到远
+            std::vector<int> tmp;
+            tmp.reserve(pred_k);
+            while (!result_queue.empty()) {
+                tmp.push_back((int)result_queue.top().second);
+                result_queue.pop();
+            }
+            std::reverse(tmp.begin(), tmp.end());
+            for (size_t j = 0; j < tmp.size() && j < (size_t)pred_k; ++j) {
+                pred[qi][j] = tmp[j];
+            }
+            if (ENABLE_PROGRESS && ((qi + 1) % PROGRESS_STEP_SEARCH == 0 || qi + 1 == num_to_eval))
+                progress_bar("Searching", qi + 1, num_to_eval, t0);
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+
+        build_ms = std::chrono::duration<double>(t_build_end - t_build_start).count() * 1000.0;
+        search_ms = std::chrono::duration<double>(t1 - t0).count() * 1000.0;
+    }
+    else { // brute
         BSolution sol;
         auto t_build_start = std::chrono::high_resolution_clock::now();
         sol.build(dim, base_data);
@@ -353,6 +464,8 @@ int main(int argc, char** argv) {
         auto t0 = std::chrono::high_resolution_clock::now();
         for (size_t i = 0; i < num_to_eval; ++i) {
             sol.search(queries[i], pred[i].data());
+            if (ENABLE_PROGRESS && ((i + 1) % PROGRESS_STEP_SEARCH == 0 || i + 1 == num_to_eval))
+                progress_bar("Searching", i + 1, num_to_eval, t0);
         }
         auto t1 = std::chrono::high_resolution_clock::now();
         build_ms = std::chrono::duration<double>(t_build_end - t_build_start).count() * 1000.0;
@@ -367,6 +480,7 @@ int main(int argc, char** argv) {
     size_t total_hits = 0;      // 总命中数
     size_t total_possible = num_to_eval * k_gt; // 总可能命中数
 
+    auto eval_start_tp = std::chrono::high_resolution_clock::now();
     for (size_t i = 0; i < num_to_eval; ++i) {
         const auto &gt_row = gt.indices[i];
         std::unordered_set<int> gt_set(gt_row.begin(), gt_row.end());
@@ -382,6 +496,8 @@ int main(int argc, char** argv) {
         }
         recall_sum += (double)hits / (double)k_gt;
         total_hits += hits;
+        if (ENABLE_PROGRESS && ((i + 1) % PROGRESS_STEP_EVAL == 0 || i + 1 == num_to_eval))
+            progress_bar("Evaluating", i + 1, num_to_eval, eval_start_tp);
     }
 
     double top1_acc = (double)correct_top1 / (double)num_to_eval;

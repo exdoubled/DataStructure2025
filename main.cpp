@@ -33,6 +33,15 @@
 // 只处理前 N 条查询（0 表示不限制，处理全部）
 #define RUN_FIRST_N 0
 
+// ---- Unified progress bar macros ----
+#define ENABLE_PROGRESS 1
+#define PROGRESS_BAR_WIDTH 30
+#define PROGRESS_STEP_LOAD 200000
+#define PROGRESS_STEP_SEARCH 200
+#define PROGRESS_STEP_WRITE 1000
+#define PROGRESS_STEP_EVAL 500
+static void progress_bar(const char* stage, size_t current, size_t total,
+                         std::chrono::high_resolution_clock::time_point start_tp);
 
 std::string filePath;
 size_t pointsnum = 0;
@@ -89,6 +98,7 @@ size_t load_flat_vectors_from_txt(const std::string &path, int dim, size_t max_c
     out_flat.reserve(std::min<size_t>(max_count, 1024) * dim);
     std::string line;
     size_t read = 0;
+    auto start_tp = std::chrono::high_resolution_clock::now();
     while (read < max_count && std::getline(ifs, line)) {
         if (line.empty()) continue;
         std::istringstream ss(line);
@@ -103,7 +113,10 @@ size_t load_flat_vectors_from_txt(const std::string &path, int dim, size_t max_c
         }
         out_flat.insert(out_flat.end(), row.begin(), row.end());
         ++read;
+        if (ENABLE_PROGRESS && (read % PROGRESS_STEP_LOAD == 0 || read == max_count))
+            progress_bar("Loading base", read, max_count, start_tp);
     }
+    if (ENABLE_PROGRESS) progress_bar("Loading base", read, read, start_tp);
     return read;
 }
 
@@ -122,6 +135,7 @@ size_t load_queries_from_txt(const std::string &base_path, int dim, size_t max_q
             std::ifstream ifs(candidate);
             if (!ifs.is_open()) return 0;
             std::string line;
+            auto start_tp = std::chrono::high_resolution_clock::now();
             while ((int)out_queries.size() < (int)max_queries && std::getline(ifs, line)) {
                 if (line.empty()) continue;
                 std::istringstream ss(line);
@@ -129,7 +143,14 @@ size_t load_queries_from_txt(const std::string &base_path, int dim, size_t max_q
                 float v;
                 while ((int)row.size() < dim && ss >> v) row.push_back(v);
                 if ((int)row.size() == dim) out_queries.push_back(std::move(row));
+
+                if (ENABLE_PROGRESS) {
+                    size_t cur = out_queries.size();
+                    if (cur % PROGRESS_STEP_LOAD == 0 || cur == max_queries)
+                        progress_bar("Loading queries", cur, max_queries, start_tp);
+                }
             }
+            if (ENABLE_PROGRESS) progress_bar("Loading queries", out_queries.size(), out_queries.size(), start_tp);
             return out_queries.size();
         }
     }
@@ -142,6 +163,7 @@ size_t load_queries_from_txt(const std::string &base_path, int dim, size_t max_q
             std::ifstream ifs(candidate);
             if (!ifs.is_open()) return 0;
             std::string line;
+            auto start_tp = std::chrono::high_resolution_clock::now();
             while ((int)out_queries.size() < (int)max_queries && std::getline(ifs, line)) {
                 if (line.empty()) continue;
                 std::istringstream ss(line);
@@ -150,6 +172,7 @@ size_t load_queries_from_txt(const std::string &base_path, int dim, size_t max_q
                 while ((int)row.size() < dim && ss >> v) row.push_back(v);
                 if ((int)row.size() == dim) out_queries.push_back(std::move(row));
             }
+            if (ENABLE_PROGRESS) progress_bar("Loading queries", out_queries.size(), out_queries.size(), start_tp);
             return out_queries.size();
         }
     }
@@ -165,6 +188,7 @@ size_t load_queries_from_txt(const std::string &base_path, int dim, size_t max_q
                 std::ifstream ifs(cand);
                 if (!ifs.is_open()) return 0;
                 std::string line;
+                auto start_tp = std::chrono::high_resolution_clock::now();
                 while ((int)out_queries.size() < (int)max_queries && std::getline(ifs, line)) {
                     if (line.empty()) continue;
                     std::istringstream ss(line);
@@ -173,6 +197,7 @@ size_t load_queries_from_txt(const std::string &base_path, int dim, size_t max_q
                     while ((int)row.size() < dim && ss >> v) row.push_back(v);
                     if ((int)row.size() == dim) out_queries.push_back(std::move(row));
                 }
+                if (ENABLE_PROGRESS) progress_bar("Loading queries", out_queries.size(), out_queries.size(), start_tp);
                 return out_queries.size();
             }
         }
@@ -206,39 +231,85 @@ static void generate_extreme_queries_to_file(const std::string &outfile, int dim
     const float BIG = 1e6f;
     const float EPS = 1e-9f;
 
+    // 新增：进度起始时间
+    auto start_tp = std::chrono::high_resolution_clock::now();
+
     size_t written = 0;
     std::vector<float> v(dim, 0.0f);
 
     auto ensure_cap = [&](size_t need = 1) { return written + need <= total_count; };
 
     // 1) fixed patterns if room
-    if (ensure_cap()) { std::fill(v.begin(), v.end(), 0.0f); write_vec(ofs, v); ++written; }
-    if (ensure_cap()) { std::fill(v.begin(), v.end(), 1.0f); write_vec(ofs, v); ++written; }
-    if (ensure_cap()) { std::fill(v.begin(), v.end(), -1.0f); write_vec(ofs, v); ++written; }
-    if (ensure_cap()) { std::fill(v.begin(), v.end(), BIG); write_vec(ofs, v); ++written; }
-    if (ensure_cap()) { std::fill(v.begin(), v.end(), -BIG); write_vec(ofs, v); ++written; }
-    if (ensure_cap()) { for (int i = 0; i < dim; ++i) v[i] = (i % 2 == 0) ? BIG : -BIG; write_vec(ofs, v); ++written; }
-    if (ensure_cap()) { std::fill(v.begin(), v.end(), EPS); write_vec(ofs, v); ++written; }
+    if (ensure_cap()) { std::fill(v.begin(), v.end(), 0.0f); write_vec(ofs, v); ++written;
+        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
+            progress_bar("Gen queries", written, total_count, start_tp);
+    }
+    if (ensure_cap()) { std::fill(v.begin(), v.end(), 1.0f); write_vec(ofs, v); ++written;
+        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
+            progress_bar("Gen queries", written, total_count, start_tp);
+    }
+    if (ensure_cap()) { std::fill(v.begin(), v.end(), -1.0f); write_vec(ofs, v); ++written;
+        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
+            progress_bar("Gen queries", written, total_count, start_tp);
+    }
+    if (ensure_cap()) { std::fill(v.begin(), v.end(), BIG); write_vec(ofs, v); ++written;
+        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
+            progress_bar("Gen queries", written, total_count, start_tp);
+    }
+    if (ensure_cap()) { std::fill(v.begin(), v.end(), -BIG); write_vec(ofs, v); ++written;
+        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
+            progress_bar("Gen queries", written, total_count, start_tp);
+    }
+    if (ensure_cap()) { for (int i = 0; i < dim; ++i) v[i] = (i % 2 == 0) ? BIG : -BIG; write_vec(ofs, v); ++written;
+        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
+            progress_bar("Gen queries", written, total_count, start_tp);
+    }
+    if (ensure_cap()) { std::fill(v.begin(), v.end(), EPS); write_vec(ofs, v); ++written;
+        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
+            progress_bar("Gen queries", written, total_count, start_tp);
+    }
 
     // 2) one-hot and negative one-hot
-    for (int i = 0; i < dim && ensure_cap(); ++i) { std::fill(v.begin(), v.end(), 0.0f); v[i] = 1.0f; write_vec(ofs, v); ++written; }
-    for (int i = 0; i < dim && ensure_cap(); ++i) { std::fill(v.begin(), v.end(), 0.0f); v[i] = -1.0f; write_vec(ofs, v); ++written; }
+    for (int i = 0; i < dim && ensure_cap(); ++i) {
+        std::fill(v.begin(), v.end(), 0.0f); v[i] = 1.0f; write_vec(ofs, v); ++written;
+        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
+            progress_bar("Gen queries", written, total_count, start_tp);
+    }
+    for (int i = 0; i < dim && ensure_cap(); ++i) {
+        std::fill(v.begin(), v.end(), 0.0f); v[i] = -1.0f; write_vec(ofs, v); ++written;
+        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
+            progress_bar("Gen queries", written, total_count, start_tp);
+    }
 
     // 3) ramps
-    if (ensure_cap()) { for (int i = 0; i < dim; ++i) v[i] = (float)i / std::max(1, dim - 1); write_vec(ofs, v); ++written; }
-    if (ensure_cap()) { for (int i = 0; i < dim; ++i) v[i] = (float)(dim - 1 - i) / std::max(1, dim - 1); write_vec(ofs, v); ++written; }
+    if (ensure_cap()) { for (int i = 0; i < dim; ++i) v[i] = (float)i / std::max(1, dim - 1); write_vec(ofs, v); ++written;
+        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
+            progress_bar("Gen queries", written, total_count, start_tp);
+    }
+    if (ensure_cap()) { for (int i = 0; i < dim; ++i) v[i] = (float)(dim - 1 - i) / std::max(1, dim - 1); write_vec(ofs, v); ++written;
+        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
+            progress_bar("Gen queries", written, total_count, start_tp);
+    }
 
     // 4) sinusoid and checkerboard
-    if (ensure_cap()) { for (int i = 0; i < dim; ++i) v[i] = std::sin(2 * 3.1415926535 * i / std::max(1, dim)); write_vec(ofs, v); ++written; }
-    if (ensure_cap()) { for (int i = 0; i < dim; ++i) v[i] = (i % 2 == 0) ? 1.0f : -1.0f; write_vec(ofs, v); ++written; }
-    if (ensure_cap()) { for (int i = 0; i < dim; ++i) v[i] = (i % 2 == 0) ? -1.0f : 1.0f; write_vec(ofs, v); ++written; }
+    if (ensure_cap()) { for (int i = 0; i < dim; ++i) v[i] = std::sin(2 * 3.1415926535 * i / std::max(1, dim)); write_vec(ofs, v); ++written;
+        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
+            progress_bar("Gen queries", written, total_count, start_tp);
+    }
+    if (ensure_cap()) { for (int i = 0; i < dim; ++i) v[i] = (i % 2 == 0) ? 1.0f : -1.0f; write_vec(ofs, v); ++written;
+        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
+            progress_bar("Gen queries", written, total_count, start_tp);
+    }
+    if (ensure_cap()) { for (int i = 0; i < dim; ++i) v[i] = (i % 2 == 0) ? -1.0f : 1.0f; write_vec(ofs, v); ++written;
+        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
+            progress_bar("Gen queries", written, total_count, start_tp);
+    }
 
     auto gen_sparse_spikes = [&](int count, int spikes) {
         std::uniform_int_distribution<int> uid(0, std::max(0, dim - 1));
         for (int c = 0; c < count && ensure_cap(); ++c) {
             std::fill(v.begin(), v.end(), 0.0f);
-            std::vector<int> idx;
-            idx.reserve(spikes);
+            std::vector<int> idx; idx.reserve(spikes);
             while ((int)idx.size() < spikes) {
                 int id = uid(rng);
                 bool seen = false; for (int t : idx) if (t == id) { seen = true; break; }
@@ -246,6 +317,8 @@ static void generate_extreme_queries_to_file(const std::string &outfile, int dim
             }
             for (int id : idx) v[id] = coin(rng) ? BIG : -BIG;
             write_vec(ofs, v); ++written;
+            if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
+                progress_bar("Gen queries", written, total_count, start_tp);
         }
     };
 
@@ -253,6 +326,8 @@ static void generate_extreme_queries_to_file(const std::string &outfile, int dim
         for (int c = 0; c < count && ensure_cap(); ++c) {
             for (int i = 0; i < dim; ++i) v[i] = dist(rng);
             write_vec(ofs, v); ++written;
+            if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
+                progress_bar("Gen queries", written, total_count, start_tp);
         }
     };
 
@@ -260,6 +335,8 @@ static void generate_extreme_queries_to_file(const std::string &outfile, int dim
         for (int c = 0; c < count && ensure_cap(); ++c) {
             for (int i = 0; i < dim; ++i) v[i] = coin(rng) ? BIG : -BIG;
             write_vec(ofs, v); ++written;
+            if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
+                progress_bar("Gen queries", written, total_count, start_tp);
         }
     };
 
@@ -268,6 +345,8 @@ static void generate_extreme_queries_to_file(const std::string &outfile, int dim
             for (int s = 0; s < dim && ensure_cap(); ++s) {
                 for (int i = 0; i < dim; ++i) v[(i + s) % dim] = (i % 2 == 0) ? 1.0f : -1.0f;
                 write_vec(ofs, v); ++written;
+                if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
+                    progress_bar("Gen queries", written, total_count, start_tp);
             }
         }
     };
@@ -284,10 +363,32 @@ static void generate_extreme_queries_to_file(const std::string &outfile, int dim
     while (written < total_count) {
         std::fill(v.begin(), v.end(), 0.1f);
         write_vec(ofs, v); ++written;
+        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
+            progress_bar("Gen queries", written, total_count, start_tp);
     }
 
     ofs.close();
     std::cerr << "Generated " << written << " extreme queries to " << outfile << std::endl;
+}
+
+static void progress_bar(const char* stage, size_t current, size_t total,
+                         std::chrono::high_resolution_clock::time_point start_tp) {
+#if ENABLE_PROGRESS
+    if (total == 0) return;
+    double ratio = (double)current / (double)total;
+    int filled = (int)std::round(ratio * PROGRESS_BAR_WIDTH);
+    double elapsed = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start_tp).count();
+    double per = elapsed / std::max<size_t>(1, current);
+    double eta = per * (current < total ? (total - current) : 0);
+    std::ostringstream bar;
+    bar << '['; for (int i = 0; i < PROGRESS_BAR_WIDTH; ++i) bar << (i < filled ? '#' : '.'); bar << ']';
+    std::cout << "\r" << stage << ' ' << bar.str()
+              << ' ' << current << '/' << total
+              << " (" << std::fixed << std::setprecision(1) << ratio * 100.0 << "%)"
+              << " elapsed:" << std::setprecision(2) << elapsed << "s"
+              << " ETA:" << std::setprecision(2) << eta << "s" << std::flush;
+    if (current == total) std::cout << "\n";
+#endif
 }
 
 int main(int argc, char** argv) {
@@ -412,39 +513,14 @@ int main(int argc, char** argv) {
         solution.build(dim, base_data);
         auto end1 = std::chrono::high_resolution_clock::now();
         build_duration = end1 - start1;
-
+        if (ENABLE_PROGRESS) std::cerr << "[Progress] Build done in " 
+                                       << std::chrono::duration<double>(build_duration).count() << "s\n";
         // Search
         auto start2 = std::chrono::high_resolution_clock::now();
         for (int i = 0; i < processed_queries; ++i) {
             solution.search(query_data[i], &result[i][0]);
-
-            if (PRINT_PROGRESS) {
-                bool should_print = ((i + 1) % PROGRESS_EVERY == 0) || (i + 1 == processed_queries);
-                if (should_print) {
-                    auto now = std::chrono::high_resolution_clock::now();
-                    double elapsed = std::chrono::duration<double>(now - start2).count();
-                    double per_q = elapsed / std::max(1, i + 1);
-                    int remaining = processed_queries - (i + 1);
-                    double eta = per_q * remaining;
-
-                    // simple progress bar
-                    const int barWidth = 30;
-                    double ratio = (double)(i + 1) / processed_queries;
-                    int filled = (int)std::round(ratio * barWidth);
-                    std::ostringstream bar;
-                    bar << '[';
-                    for (int j = 0; j < barWidth; ++j) bar << (j < filled ? '#' : '.');
-                    bar << ']';
-
-                    std::cout << "\r" << bar.str()
-                              << " " << (i + 1) << "/" << processed_queries
-                              << " (" << std::fixed << std::setprecision(1) << (ratio * 100.0) << "%)"
-                              << " elapsed: " << std::setprecision(2) << elapsed << "s"
-                              << " ETA: " << std::setprecision(2) << eta << "s"
-                              << std::flush;
-                    if (i + 1 == processed_queries) std::cout << "\n";
-                }
-            }
+            if (ENABLE_PROGRESS && ((i + 1) % PROGRESS_STEP_SEARCH == 0 || i + 1 == processed_queries))
+                progress_bar("Searching", i + 1, processed_queries, start2);
         }
         auto end2 = std::chrono::high_resolution_clock::now();
         search_duration = end2 - start2;
@@ -454,40 +530,17 @@ int main(int argc, char** argv) {
         bsolution.build(dim, base_data);
         auto end1 = std::chrono::high_resolution_clock::now();
         build_duration = end1 - start1;
-
+        if (ENABLE_PROGRESS) std::cerr << "[Progress] Build done in " 
+                                       << std::chrono::duration<double>(build_duration).count() << "s\n";
         // Search
         auto start2 = std::chrono::high_resolution_clock::now();
         for (int i = 0; i < processed_queries; ++i) {
             bsolution.search(query_data[i], &result[i][0]);
-
-            if (PRINT_PROGRESS) {
-                bool should_print = ((i + 1) % PROGRESS_EVERY == 0) || (i + 1 == processed_queries);
-                if (should_print) {
-                    auto now = std::chrono::high_resolution_clock::now();
-                    double elapsed = std::chrono::duration<double>(now - start2).count();
-                    double per_q = elapsed / std::max(1, i + 1);
-                    int remaining = processed_queries - (i + 1);
-                    double eta = per_q * remaining;
-
-                    // simple progress bar
-                    const int barWidth = 30;
-                    double ratio = (double)(i + 1) / processed_queries;
-                    int filled = (int)std::round(ratio * barWidth);
-                    std::ostringstream bar;
-                    bar << '[';
-                    for (int j = 0; j < barWidth; ++j) bar << (j < filled ? '#' : '.');
-                    bar << ']';
-
-                    std::cout << "\r" << bar.str()
-                              << " " << (i + 1) << "/" << processed_queries
-                              << " (" << std::fixed << std::setprecision(1) << (ratio * 100.0) << "%)"
-                              << " elapsed: " << std::setprecision(2) << elapsed << "s"
-                              << " ETA: " << std::setprecision(2) << eta << "s"
-                              << std::flush;
-                    if (i + 1 == processed_queries) std::cout << "\n";
-                }
-            }
+            if (ENABLE_PROGRESS && ((i + 1) % PROGRESS_STEP_SEARCH == 0 || i + 1 == processed_queries))
+                progress_bar("Searching", i + 1, processed_queries, start2);
         }
+        auto end2 = std::chrono::high_resolution_clock::now();
+        search_duration = end2 - start2;
     }
 
     // 打印到终端（单位统一为 ms）
@@ -518,12 +571,16 @@ int main(int argc, char** argv) {
     ofs << "Average search latency ms_per_query: " << avg_query_ms << "\n";
     ofs << "Num queries: " << processed_queries << "\n";
     ofs << "Results (top-" << k << " indices per query, space-separated):\n";
+    auto write_start_tp = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < processed_queries; ++i) {
         for (int j = 0; j < k; ++j) {
             ofs << result[i][j];
             if (j + 1 < k) ofs << ' ';
         }
         ofs << '\n';
+
+        if (ENABLE_PROGRESS && ((i + 1) % PROGRESS_STEP_WRITE == 0 || i + 1 == processed_queries))
+            progress_bar("Writing ans", i + 1, processed_queries, write_start_tp);
     }
     ofs.close();
 
