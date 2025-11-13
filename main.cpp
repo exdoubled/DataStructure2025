@@ -20,10 +20,18 @@
 #include <cctype>
 #include <cmath>
 #include <iomanip>
+#include <mutex>
 
 #include "MySolution.h"
 #include "Brute.h"
 #include "Config.h"
+#include "BinaryIO.h"
+// 部分 MinGW 发行版（win32 线程模型）可能缺失 _GLIBCXX_HAS_GTHREAD，导致 std::mutex 在编译期被禁用。
+// 为保证单线程/仿真环境下能编译通过，这里做与 checker.cpp 相同的兜底处理：
+#if !defined(_GLIBCXX_HAS_GTHREAD)
+namespace std { class mutex { public: void lock() {} void unlock() {} }; }
+#endif
+#include "hnswlib/hnswlib.h"
 
 // ---- Runtime knobs (easy to tweak) ----
 // 是否打印进度（1 打印 / 0 不打印）
@@ -60,6 +68,115 @@ static bool file_exists(const std::string &path) {
     if (path.empty()) return false;
     std::ifstream ifs(path);
     return ifs.good();
+}
+
+// 文本读取实现（在本文件后面定义），供下方 auto 加载函数调用
+size_t load_flat_vectors_from_txt(const std::string &path, int dim, size_t max_count, std::vector<float> &out_flat);
+size_t load_queries_from_txt(const std::string &base_path, int dim, size_t max_queries, std::vector<std::vector<float>> &out_queries, std::string* used_txt_path=nullptr);
+
+// 返回 base.txt 同目录的 "base.bin" 或 "query.bin" 路径；若无法解析目录，则返回工作目录下的目标文件名
+static std::string sibling_bin_path(const std::string &txt_path, const std::string &bin_name) {
+    if (!txt_path.empty()) {
+        size_t pos_sep = txt_path.find_last_of("\\/");
+        if (pos_sep != std::string::npos) {
+            char sep = (txt_path.find('\\') != std::string::npos) ? '\\' : '/';
+            return txt_path.substr(0, pos_sep + 1) + bin_name;
+        }
+    }
+    return bin_name; // cwd fallback
+}
+
+// 从给定的 txt 路径派生对应的 .bin 路径：同目录，若后缀为 .txt 则替换为 .bin，否则追加 .bin
+static std::string derive_bin_path_from_txt(const std::string &txt_path) {
+    size_t pos_sep = txt_path.find_last_of("\\/");
+    std::string dir = (pos_sep != std::string::npos) ? txt_path.substr(0, pos_sep + 1) : std::string();
+    std::string file = (pos_sep != std::string::npos) ? txt_path.substr(pos_sep + 1) : txt_path;
+    size_t dot = file.find_last_of('.');
+    if (dot != std::string::npos && dot > 0) {
+        std::string ext = file.substr(dot);
+        if (ext == ".txt" || ext == ".TXT") {
+            return dir + file.substr(0, dot) + ".bin";
+        }
+    }
+    return dir + file + ".bin";
+}
+
+// 将 ".../base.txt" 替换为 ".../base.bin"；若不包含 base.txt，退化到同目录 + bin_name
+static std::string replace_base_txt_with_bin(const std::string &base_txt, const std::string &bin_name) {
+    size_t pos = base_txt.find("base.txt");
+    if (pos != std::string::npos) {
+        return base_txt.substr(0, pos) + bin_name;
+    }
+    return sibling_bin_path(base_txt, bin_name);
+}
+
+// 优先从二进制 .bin 读取 base，成功则返回向量数；否则回退到 txt
+static size_t load_base_vectors_auto(const std::string &base_txt_path, int expected_dim, std::vector<float> &out_flat, int &out_dim_actual) {
+    out_dim_actual = expected_dim;
+    std::vector<std::string> candidates;
+    // 尝试与 base.txt 同目录的 base.bin
+    candidates.push_back(replace_base_txt_with_bin(base_txt_path, "base.bin"));
+    // 也尝试工作目录下的 base.bin
+    candidates.emplace_back("base.bin");
+
+    for (const auto &cand : candidates) {
+        if (file_exists(cand)) {
+            int dim_rd = 0; size_t cnt = 0; std::vector<float> flat;
+            if (binio::read_vecbin(cand, dim_rd, cnt, flat)) {
+                if (expected_dim > 0 && dim_rd != expected_dim) {
+                    std::cerr << "[WARN] Dimension mismatch in bin (" << cand << "): " << dim_rd
+                              << " != expected " << expected_dim << ". Ignored.\n";
+                } else {
+                    out_flat.swap(flat);
+                    out_dim_actual = dim_rd;
+                    std::cerr << "Loaded base from bin: " << cand << ", N=" << cnt << ", dim=" << dim_rd << "\n";
+                    return cnt;
+                }
+            }
+        }
+    }
+    // 回退到文本读取
+    size_t read = load_flat_vectors_from_txt(base_txt_path, expected_dim, pointsnum, out_flat);
+    out_dim_actual = expected_dim;
+    return read;
+}
+
+// 优先从二进制 .bin 读取 queries，成功则返回数量；否则回退到 txt
+static size_t load_queries_auto(const std::string &base_txt_path, int expected_dim, size_t max_queries, std::vector<std::vector<float>> &out_queries) {
+    std::vector<std::string> cands;
+    // 与 base.txt 同目录的 query.bin
+    if (!base_txt_path.empty()) {
+        size_t pos_sep = base_txt_path.find_last_of("\\/");
+        if (pos_sep != std::string::npos) {
+            cands.emplace_back(base_txt_path.substr(0, pos_sep + 1) + "query.bin");
+        }
+        // base.txt -> query.bin
+        size_t pos = base_txt_path.find("base.txt");
+        if (pos != std::string::npos) {
+            cands.emplace_back(base_txt_path.substr(0, pos) + "query.bin");
+        }
+    }
+    // 工作目录
+    cands.emplace_back("query.bin");
+
+    for (const auto &cand : cands) {
+        if (file_exists(cand)) {
+            std::vector<std::vector<float>> qs;
+            if (binio::read_queries_vecbin(cand, expected_dim, max_queries, qs)) {
+                out_queries.swap(qs);
+                std::cerr << "Loaded queries from bin: " << cand << ", count=" << out_queries.size() << ", dim=" << expected_dim << "\n";
+                return out_queries.size();
+            }
+        }
+    }
+    // 回退到 txt，并在成功读取后，于同目录生成 query.bin（仅从 txt 转换一次）
+    std::string used_txt;
+    size_t read = load_queries_from_txt(base_txt_path, expected_dim, max_queries, out_queries, &used_txt);
+    if (read > 0 && !used_txt.empty()) {
+        std::string qbin = derive_bin_path_from_txt(used_txt);
+        binio::write_queries_vecbin(qbin, expected_dim, out_queries);
+    }
+    return read;
 }
 
 // 读取数据集信息
@@ -121,7 +238,8 @@ size_t load_flat_vectors_from_txt(const std::string &path, int dim, size_t max_c
 }
 
 // 读取查询向量文件
-size_t load_queries_from_txt(const std::string &base_path, int dim, size_t max_queries, std::vector<std::vector<float>> &out_queries) {
+size_t load_queries_from_txt(const std::string &base_path, int dim, size_t max_queries, std::vector<std::vector<float>> &out_queries, std::string* used_txt_path) {
+    if (used_txt_path) *used_txt_path = "";
     if (base_path.empty()) return 0;
     out_queries.clear();
 
@@ -151,6 +269,7 @@ size_t load_queries_from_txt(const std::string &base_path, int dim, size_t max_q
                 }
             }
             if (ENABLE_PROGRESS) progress_bar("Loading queries", out_queries.size(), out_queries.size(), start_tp);
+            if (used_txt_path) *used_txt_path = candidate;
             return out_queries.size();
         }
     }
@@ -173,6 +292,7 @@ size_t load_queries_from_txt(const std::string &base_path, int dim, size_t max_q
                 if ((int)row.size() == dim) out_queries.push_back(std::move(row));
             }
             if (ENABLE_PROGRESS) progress_bar("Loading queries", out_queries.size(), out_queries.size(), start_tp);
+            if (used_txt_path) *used_txt_path = candidate;
             return out_queries.size();
         }
     }
@@ -183,6 +303,13 @@ size_t load_queries_from_txt(const std::string &base_path, int dim, size_t max_q
         candidates.emplace_back(QUERYFILEPATH);
         candidates.emplace_back(std::string(".\\") + QUERYFILEPATH);
         candidates.emplace_back(std::string("./") + QUERYFILEPATH);
+        // dataset-case friendly fallbacks
+        candidates.emplace_back("query0.txt");
+        candidates.emplace_back(".\\query0.txt");
+        candidates.emplace_back("./query0.txt");
+        candidates.emplace_back("query1.txt");
+        candidates.emplace_back(".\\query1.txt");
+        candidates.emplace_back("./query1.txt");
         for (const auto &cand : candidates) {
             if (file_exists(cand)) {
                 std::ifstream ifs(cand);
@@ -198,6 +325,7 @@ size_t load_queries_from_txt(const std::string &base_path, int dim, size_t max_q
                     if ((int)row.size() == dim) out_queries.push_back(std::move(row));
                 }
                 if (ENABLE_PROGRESS) progress_bar("Loading queries", out_queries.size(), out_queries.size(), start_tp);
+                if (used_txt_path) *used_txt_path = cand;
                 return out_queries.size();
             }
         }
@@ -207,168 +335,44 @@ size_t load_queries_from_txt(const std::string &base_path, int dim, size_t max_q
 }
 
 // 生成极端数据文件（query 用）
-static void generate_extreme_queries_to_file(const std::string &outfile, int dim, size_t total_count) {
-    auto write_vec = [](std::ofstream &ofs, const std::vector<float> &v) {
-        for (int i = 0; i < (int)v.size(); ++i) {
-            if (i) ofs << ' ';
-            ofs << v[i];
-        }
-        ofs << '\n';
-    };
-
+static void generate_extreme_queries_to_file(const std::string &outfile, int dim, size_t total_count, int dataset_case) {
+    // 改为：生成完全随机的 query（均匀分布 [-1, 1]），不再包含任何极端/特例模式
     std::ofstream ofs(outfile);
     if (!ofs.is_open()) {
         std::cerr << "Failed to open for writing: " << outfile << std::endl;
         return;
     }
 
-    std::mt19937 rng(20251105);
-    std::uniform_real_distribution<float> uni_m1_1(-1.f, 1.f);
-    std::uniform_real_distribution<float> uni_small(-1e-6f, 1e-6f);
-    std::uniform_real_distribution<float> uni_wide(-1e3f, 1e3f);
-    std::bernoulli_distribution coin(0.5);
-
-    const float BIG = 1e6f;
-    const float EPS = 1e-9f;
-
-    // 新增：进度起始时间
+    std::mt19937 rng(20251113);
+    std::uniform_real_distribution<float> uni01(0.f, 1.f);
+    std::uniform_real_distribution<float> uni11(-1.f, 1.f);
+    std::uniform_int_distribution<int> uni255(0, 255);
     auto start_tp = std::chrono::high_resolution_clock::now();
 
-    size_t written = 0;
-    std::vector<float> v(dim, 0.0f);
-
-    auto ensure_cap = [&](size_t need = 1) { return written + need <= total_count; };
-
-    // 1) fixed patterns if room
-    if (ensure_cap()) { std::fill(v.begin(), v.end(), 0.0f); write_vec(ofs, v); ++written;
-        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
-            progress_bar("Gen queries", written, total_count, start_tp);
-    }
-    if (ensure_cap()) { std::fill(v.begin(), v.end(), 1.0f); write_vec(ofs, v); ++written;
-        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
-            progress_bar("Gen queries", written, total_count, start_tp);
-    }
-    if (ensure_cap()) { std::fill(v.begin(), v.end(), -1.0f); write_vec(ofs, v); ++written;
-        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
-            progress_bar("Gen queries", written, total_count, start_tp);
-    }
-    if (ensure_cap()) { std::fill(v.begin(), v.end(), BIG); write_vec(ofs, v); ++written;
-        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
-            progress_bar("Gen queries", written, total_count, start_tp);
-    }
-    if (ensure_cap()) { std::fill(v.begin(), v.end(), -BIG); write_vec(ofs, v); ++written;
-        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
-            progress_bar("Gen queries", written, total_count, start_tp);
-    }
-    if (ensure_cap()) { for (int i = 0; i < dim; ++i) v[i] = (i % 2 == 0) ? BIG : -BIG; write_vec(ofs, v); ++written;
-        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
-            progress_bar("Gen queries", written, total_count, start_tp);
-    }
-    if (ensure_cap()) { std::fill(v.begin(), v.end(), EPS); write_vec(ofs, v); ++written;
-        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
-            progress_bar("Gen queries", written, total_count, start_tp);
-    }
-
-    // 2) one-hot and negative one-hot
-    for (int i = 0; i < dim && ensure_cap(); ++i) {
-        std::fill(v.begin(), v.end(), 0.0f); v[i] = 1.0f; write_vec(ofs, v); ++written;
-        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
-            progress_bar("Gen queries", written, total_count, start_tp);
-    }
-    for (int i = 0; i < dim && ensure_cap(); ++i) {
-        std::fill(v.begin(), v.end(), 0.0f); v[i] = -1.0f; write_vec(ofs, v); ++written;
-        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
-            progress_bar("Gen queries", written, total_count, start_tp);
-    }
-
-    // 3) ramps
-    if (ensure_cap()) { for (int i = 0; i < dim; ++i) v[i] = (float)i / std::max(1, dim - 1); write_vec(ofs, v); ++written;
-        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
-            progress_bar("Gen queries", written, total_count, start_tp);
-    }
-    if (ensure_cap()) { for (int i = 0; i < dim; ++i) v[i] = (float)(dim - 1 - i) / std::max(1, dim - 1); write_vec(ofs, v); ++written;
-        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
-            progress_bar("Gen queries", written, total_count, start_tp);
-    }
-
-    // 4) sinusoid and checkerboard
-    if (ensure_cap()) { for (int i = 0; i < dim; ++i) v[i] = std::sin(2 * 3.1415926535 * i / std::max(1, dim)); write_vec(ofs, v); ++written;
-        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
-            progress_bar("Gen queries", written, total_count, start_tp);
-    }
-    if (ensure_cap()) { for (int i = 0; i < dim; ++i) v[i] = (i % 2 == 0) ? 1.0f : -1.0f; write_vec(ofs, v); ++written;
-        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
-            progress_bar("Gen queries", written, total_count, start_tp);
-    }
-    if (ensure_cap()) { for (int i = 0; i < dim; ++i) v[i] = (i % 2 == 0) ? -1.0f : 1.0f; write_vec(ofs, v); ++written;
-        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
-            progress_bar("Gen queries", written, total_count, start_tp);
-    }
-
-    auto gen_sparse_spikes = [&](int count, int spikes) {
-        std::uniform_int_distribution<int> uid(0, std::max(0, dim - 1));
-        for (int c = 0; c < count && ensure_cap(); ++c) {
-            std::fill(v.begin(), v.end(), 0.0f);
-            std::vector<int> idx; idx.reserve(spikes);
-            while ((int)idx.size() < spikes) {
-                int id = uid(rng);
-                bool seen = false; for (int t : idx) if (t == id) { seen = true; break; }
-                if (!seen) idx.push_back(id);
-            }
-            for (int id : idx) v[id] = coin(rng) ? BIG : -BIG;
-            write_vec(ofs, v); ++written;
-            if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
-                progress_bar("Gen queries", written, total_count, start_tp);
-        }
-    };
-
-    auto gen_random = [&](int count, std::uniform_real_distribution<float> &dist) {
-        for (int c = 0; c < count && ensure_cap(); ++c) {
-            for (int i = 0; i < dim; ++i) v[i] = dist(rng);
-            write_vec(ofs, v); ++written;
-            if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
-                progress_bar("Gen queries", written, total_count, start_tp);
-        }
-    };
-
-    auto gen_dense_extremes = [&](int count) {
-        for (int c = 0; c < count && ensure_cap(); ++c) {
-            for (int i = 0; i < dim; ++i) v[i] = coin(rng) ? BIG : -BIG;
-            write_vec(ofs, v); ++written;
-            if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
-                progress_bar("Gen queries", written, total_count, start_tp);
-        }
-    };
-
-    auto gen_alternating_shifts = [&](int blocks) {
-        for (int b = 0; b < blocks && ensure_cap(); ++b) {
-            for (int s = 0; s < dim && ensure_cap(); ++s) {
-                for (int i = 0; i < dim; ++i) v[(i + s) % dim] = (i % 2 == 0) ? 1.0f : -1.0f;
-                write_vec(ofs, v); ++written;
-                if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
-                    progress_bar("Gen queries", written, total_count, start_tp);
+    std::vector<float> v(dim);
+    for (size_t i = 0; i < total_count; ++i) {
+        for (int j = 0; j < dim; ++j) {
+            if (dataset_case == 1) {
+                int iv = uni255(rng);
+                if (j) ofs << ' ';
+                ofs << iv; // SIFT: 整型 0..255
+            } else if (dataset_case == 0) {
+                float x = uni01(rng);
+                if (j) ofs << ' ';
+                ofs << std::fixed << std::setprecision(6) << x; // GloVe: (0,1) 小数
+            } else {
+                float x = uni11(rng);
+                if (j) ofs << ' ';
+                ofs << std::fixed << std::setprecision(6) << x; // 其它：[-1,1]
             }
         }
-    };
-
-    // 5) compose to reach total_count
-    gen_sparse_spikes(1000, 5);
-    gen_random(1000, uni_small);
-    gen_random(2000, uni_m1_1);
-    gen_random(2000, uni_wide);
-    gen_dense_extremes(2000);
-    gen_alternating_shifts(10); // 10 * dim lines
-
-    // 6) duplicates to fill remainder
-    while (written < total_count) {
-        std::fill(v.begin(), v.end(), 0.1f);
-        write_vec(ofs, v); ++written;
-        if (ENABLE_PROGRESS && (written % PROGRESS_STEP_WRITE == 0 || written == total_count))
-            progress_bar("Gen queries", written, total_count, start_tp);
+        ofs << '\n';
+        if (ENABLE_PROGRESS && ((i + 1) % PROGRESS_STEP_WRITE == 0 || i + 1 == total_count))
+            progress_bar("Gen queries", i + 1, total_count, start_tp);
     }
 
     ofs.close();
-    std::cerr << "Generated " << written << " extreme queries to " << outfile << std::endl;
+    std::cerr << "Generated " << total_count << " random queries to " << outfile << std::endl;
 }
 
 static void progress_bar(const char* stage, size_t current, size_t total,
@@ -395,9 +399,15 @@ int main(int argc, char** argv) {
     int dataset_case = 0;
     bool gen_only = false;
     std::string algo = "solution"; // solution | brute
-    // 新增：生成小体量 base 测试集到 test.txt
+    // 生成小体量 base 测试集到 test.txt
     bool gen_test_base = false;
     size_t gen_test_base_N = 10; // 默认 10 行，与 case 2 对齐
+    // 保存为二进制文件选项
+    bool save_bin_base = false;
+    // 强制从二进制读取
+    bool force_bin = false;
+    // 查询文件路径覆盖（txt 或 bin，取决于 --bin）
+    std::string query_override;
         auto is_unsigned_integer = [](const std::string &s) -> bool {
             if (s.empty()) return false;
             for (char c : s) if (!std::isdigit((unsigned char)c)) return false;
@@ -410,6 +420,10 @@ int main(int argc, char** argv) {
             else if (arg.rfind("--algo=", 0) == 0) { algo = arg.substr(7); }
             else if (arg == "--gen-test-base") { gen_test_base = true; }
             else if (arg.rfind("--gen-test-base=", 0) == 0) { gen_test_base = true; gen_test_base_N = (size_t)std::max(1, std::atoi(arg.substr(17).c_str())); }
+            else if (arg == "--save-bin-base") { save_bin_base = true; }
+            else if (arg == "--bin") { force_bin = true; }
+            else if (arg == "--query" && i + 1 < argc) { query_override = argv[++i]; }
+            else if (arg.rfind("--query=", 0) == 0) { query_override = arg.substr(8); }
             else if (is_unsigned_integer(arg)) {
                 dataset_case = std::atoi(arg.c_str());
             }
@@ -448,53 +462,179 @@ int main(int argc, char** argv) {
     }
 
     size_t N = pointsnum;
-    // Try to load base vectors from disk. If fails, fallback to synthetic small dataset (like before).
+    // 加载 base：若 --bin 强制二进制，则仅尝试 .bin；否则自动（bin 优先，失败回退 txt）
     size_t loaded = 0;
-    const size_t max_load = pointsnum; // try to read up to pointsnum
     if (!filePath.empty() && file_exists(filePath)) {
-        std::cerr << "Loading base vectors from: " << filePath << std::endl;
-        loaded = load_flat_vectors_from_txt(filePath, dim, max_load, base_data);
-        if (loaded == 0) {
-            std::cerr << "Failed to read base vectors from file or file empty; falling back to synthetic subset." << std::endl;
+        if (force_bin) {
+            std::vector<std::string> cands;
+            cands.push_back(replace_base_txt_with_bin(filePath, "base.bin"));
+            cands.emplace_back("base.bin");
+            bool ok = false;
+            for (const auto &cand : cands) {
+                if (file_exists(cand)) {
+                    int dim_rd = 0; size_t cnt = 0; std::vector<float> flat;
+                    if (binio::read_vecbin(cand, dim_rd, cnt, flat)) {
+                        base_data.swap(flat);
+                        dim = dim_rd; N = loaded = cnt; ok = true;
+                        std::cerr << "Loaded base (bin forced): " << cand << ", N=" << N << ", dim=" << dim << "\n";
+                        break;
+                    }
+                }
+            }
+            if (!ok) {
+                std::cerr << "[ERROR] --bin specified, but base bin not found or invalid." << std::endl;
+                return 1;
+            }
         } else {
-            N = loaded;
-            std::cerr << "Loaded " << N << " vectors from disk (dim=" << dim << ")" << std::endl;
+            int actual_dim = dim;
+            loaded = load_base_vectors_auto(filePath, dim, base_data, actual_dim);
+            dim = actual_dim; // 若 bin 中记录了维度，采用之
+            if (loaded > 0) {
+                N = loaded;
+            } else {
+                std::cerr << "Failed to read base vectors from bin/txt; falling back to synthetic subset." << std::endl;
+            }
         }
     }
 
     if (loaded == 0) {
-        // fallback: small synthetic dataset to allow testing
+        // fallback: small synthetic dataset to allow testing (dataset-aware)
         const size_t demo_cap = std::min<size_t>(pointsnum ? pointsnum : 1000, 1000);
         N = demo_cap;
         base_data.assign(N * dim, 0.0f);
         std::mt19937 rng(42);
-        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-        for (size_t i = 0; i < N; ++i) {
-            for (int j = 0; j < dim; ++j) base_data[i * dim + j] = dist(rng);
+        if (dataset_case == 1) {
+            // SIFT: 整型 0..255（以 float 存储）
+            std::uniform_int_distribution<int> di(0, 255);
+            for (size_t i = 0; i < N; ++i)
+                for (int j = 0; j < dim; ++j)
+                    base_data[i * dim + j] = static_cast<float>(di(rng));
+        } else if (dataset_case == 0) {
+            // GloVe: (0,1) 小数
+            std::uniform_real_distribution<float> df(0.f, 1.f);
+            for (size_t i = 0; i < N; ++i)
+                for (int j = 0; j < dim; ++j)
+                    base_data[i * dim + j] = df(rng);
+        } else {
+            // 其它：[-1,1]
+            std::uniform_real_distribution<float> df(-1.f, 1.f);
+            for (size_t i = 0; i < N; ++i)
+                for (int j = 0; j < dim; ++j)
+                    base_data[i * dim + j] = df(rng);
         }
         std::cerr << "Using synthetic base with N=" << N << " dim=" << dim << std::endl;
     }
 
     // 可以选择生成极端数据并退出
     if (gen_only) {
-        generate_extreme_queries_to_file(QUERYFILEPATH, dim, 10000);
+        generate_extreme_queries_to_file(QUERYFILEPATH, dim, 10000, dataset_case);
         return 0;
     }
 
-    // 尝试从 query.txt 中读取数据，否则生成随机 query
+    // 尝试从 query（优先 bin 或文本）读取数据，否则生成随机 query
     int num_queries = 10; // 默认生成 query 的个数
-    size_t qloaded = load_queries_from_txt(filePath, dim, 1000000, query_data);
+    size_t qloaded = 0;
+    if (force_bin) {
+        if (!query_override.empty()) {
+            // 强制从 override 路径按 .bin 读取
+            std::vector<std::vector<float>> qs;
+            if (!binio::read_queries_vecbin(query_override, dim, 1000000, qs)) {
+                std::cerr << "[ERROR] --bin specified, but override query bin invalid: " << query_override << std::endl;
+                return 1;
+            }
+            query_data.swap(qs);
+            qloaded = query_data.size();
+            std::cerr << "Loaded queries (bin forced override): " << query_override << ", count=" << qloaded << ", dim=" << dim << "\n";
+        } else {
+        std::vector<std::string> qcands;
+        if (!filePath.empty()) {
+            size_t pos_sep = filePath.find_last_of("\\/");
+            if (pos_sep != std::string::npos) qcands.emplace_back(filePath.substr(0, pos_sep + 1) + "query.bin");
+            size_t pos = filePath.find("base.txt");
+            if (pos != std::string::npos) qcands.emplace_back(filePath.substr(0, pos) + "query.bin");
+        }
+        qcands.emplace_back("query.bin");
+        bool ok = false;
+        for (const auto &cand : qcands) {
+            if (file_exists(cand)) {
+                std::vector<std::vector<float>> qs;
+                if (binio::read_queries_vecbin(cand, dim, 1000000, qs)) {
+                    query_data.swap(qs);
+                    qloaded = query_data.size(); ok = true;
+                    std::cerr << "Loaded queries (bin forced): " << cand << ", count=" << qloaded << ", dim=" << dim << "\n";
+                    break;
+                }
+            }
+        }
+        if (!ok) {
+            std::cerr << "[ERROR] --bin specified, but query bin not found or invalid." << std::endl;
+            return 1;
+        }
+        }
+    } else {
+        if (!query_override.empty()) {
+            // 明确指定了 txt 路径：按文本读取并派生写出 .bin
+            std::ifstream qf(query_override);
+            if (!qf.is_open()) {
+                std::cerr << "[ERROR] Cannot open query file: " << query_override << std::endl;
+                return 1;
+            }
+            std::string line;
+            std::vector<std::vector<float>> qs;
+            while (qs.size() < 1000000 && std::getline(qf, line)) {
+                if (line.empty()) continue;
+                std::istringstream ss(line);
+                std::vector<float> row; float v;
+                while ((int)row.size() < dim && ss >> v) row.push_back(v);
+                if ((int)row.size() == dim) qs.push_back(std::move(row));
+            }
+            if (!qs.empty()) {
+                query_data.swap(qs);
+                qloaded = query_data.size();
+                std::string qbin = derive_bin_path_from_txt(query_override);
+                binio::write_queries_vecbin(qbin, dim, query_data);
+                std::cerr << "Loaded queries from override txt: " << query_override << ", wrote bin: " << qbin << ", count=" << qloaded << "\n";
+            } else {
+                qloaded = 0;
+            }
+        } else {
+            qloaded = load_queries_auto(filePath, dim, 1000000, query_data);
+        }
+    }
     if (qloaded == 0) {
-        // fallback: generate random queries
+        // fallback: generate dataset-aware random queries
         std::mt19937 rng(123);
-        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
         query_data.assign(num_queries, std::vector<float>(dim));
-        for (int q = 0; q < num_queries; ++q)
-            for (int j = 0; j < dim; ++j) query_data[q][j] = dist(rng);
-        std::cerr << "Using synthetic " << num_queries << " queries." << std::endl;
+        if (dataset_case == 1) {
+            std::uniform_int_distribution<int> di(0, 255);
+            for (int q = 0; q < num_queries; ++q)
+                for (int j = 0; j < dim; ++j)
+                    query_data[q][j] = static_cast<float>(di(rng));
+        } else if (dataset_case == 0) {
+            std::uniform_real_distribution<float> df(0.f, 1.f);
+            for (int q = 0; q < num_queries; ++q)
+                for (int j = 0; j < dim; ++j)
+                    query_data[q][j] = df(rng);
+        } else {
+            std::uniform_real_distribution<float> df(-1.f, 1.f);
+            for (int q = 0; q < num_queries; ++q)
+                for (int j = 0; j < dim; ++j)
+                    query_data[q][j] = df(rng);
+        }
+        std::cerr << "Using synthetic " << num_queries << " queries (dataset-aware)." << std::endl;
     } else {
         num_queries = (int)qloaded;
         std::cerr << "Loaded " << num_queries << " queries from disk." << std::endl;
+    }
+
+    // 如需转换保存为 .bin，则此时写出 base/queries 的 .bin 文件
+    if (save_bin_base && !base_data.empty()) {
+        std::string bbin = replace_base_txt_with_bin(filePath, "base.bin");
+        if (binio::write_vecbin(bbin, dim, base_data)) {
+            std::cerr << "Saved base to bin: " << bbin << " (N=" << (base_data.size()/ (size_t)dim) << ")\n";
+        } else {
+            std::cerr << "[WARN] Failed to save base bin: " << bbin << "\n";
+        }
     }
 
     // 为每一个 TopK 分配空间
@@ -524,7 +664,41 @@ int main(int argc, char** argv) {
         }
         auto end2 = std::chrono::high_resolution_clock::now();
         search_duration = end2 - start2;
-    } else { // brute
+    } else if(algo == "hnsw"){
+        hnswlib::L2Space l2space(dim);
+        const size_t max_elements = N;
+
+        auto start1 = std::chrono::high_resolution_clock::now();
+        hnswlib::HierarchicalNSW<float> appr_alg(&l2space, max_elements, 16, 200, 42);
+        for(size_t i = 0; i < N; i++) {
+            appr_alg.addPoint((void*)&base_data[i * dim], (size_t)i);
+            if (ENABLE_PROGRESS && ((i + 1) % PROGRESS_STEP_LOAD == 0 || i + 1 == N))
+                progress_bar("Building HNSW", i + 1, N, start1);
+        }
+        appr_alg.setEf(200);
+        auto end1 = std::chrono::high_resolution_clock::now();
+        build_duration = end1 - start1;
+        if (ENABLE_PROGRESS) std::cerr << "[Progress] Build done in " 
+                                       << std::chrono::duration<double>(build_duration).count() << "s\n";
+        // Search
+        auto start2 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < processed_queries; ++i) {
+            auto pq = appr_alg.searchKnn((void*)query_data[i].data(), k);
+            std::vector<int> tmp; tmp.reserve(k);
+            while (!pq.empty()) {
+                tmp.push_back((int)pq.top().second);
+                pq.pop();
+            }
+            std::reverse(tmp.begin(), tmp.end());
+            for (int j = 0; j < k && j < (int)tmp.size(); ++j) result[i][j] = tmp[j];
+
+            if (ENABLE_PROGRESS && ((i + 1) % PROGRESS_STEP_SEARCH == 0 || i + 1 == processed_queries))
+                progress_bar("Searching HNSW", i + 1, processed_queries, start2);
+        }
+        auto end2 = std::chrono::high_resolution_clock::now();
+        search_duration = end2 - start2;
+    } 
+    else { // brute
         // Build
         auto start1 = std::chrono::high_resolution_clock::now();
         bsolution.build(dim, base_data);

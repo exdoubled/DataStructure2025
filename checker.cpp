@@ -39,6 +39,7 @@
 #include "MySolution.h"
 #include "Config.h"
 #include "Brute.h"
+#include "BinaryIO.h"
 
 // MinGW 8.1 (win32 线程模型) 可能缺失 _GLIBCXX_HAS_GTHREAD，导致 std::mutex 未定义。
 // 如果检测到该宏缺失，提供一个空实现，只用于单线程调用，避免修改 hnswlib 其它逻辑。
@@ -82,6 +83,109 @@ static bool file_exists(const std::string &path) {
     if (path.empty()) return false;
     std::ifstream ifs(path);
     return ifs.good();
+}
+
+// 前向声明：供自动加载函数调用的文本读取实现
+static size_t load_flat_vectors_from_txt(const std::string &path, int dim, size_t max_count, std::vector<float> &out_flat);
+static size_t load_queries_from_txt(const std::string &base_path, int dim, size_t max_queries, std::vector<std::vector<float>> &out_queries, std::string* used_txt_path=nullptr);
+
+// util: derive sibling path in same directory as txt_path
+static std::string sibling_bin_path(const std::string &txt_path, const std::string &bin_name) {
+    if (!txt_path.empty()) {
+        size_t pos_sep = txt_path.find_last_of("\\/");
+        if (pos_sep != std::string::npos) {
+            char sep = (txt_path.find('\\') != std::string::npos) ? '\\' : '/';
+            (void)sep; // unused, but kept for symmetry
+            return txt_path.substr(0, pos_sep + 1) + bin_name;
+        }
+    }
+    return bin_name;
+}
+
+static std::string replace_base_txt_with_bin(const std::string &base_txt, const std::string &bin_name) {
+    size_t pos = base_txt.find("base.txt");
+    if (pos != std::string::npos) return base_txt.substr(0, pos) + bin_name;
+    return sibling_bin_path(base_txt, bin_name);
+}
+
+// 从 txt 路径派生同目录 .bin 路径：.txt -> .bin，否则追加 .bin
+static std::string derive_bin_path_from_txt(const std::string &txt_path) {
+    size_t pos_sep = txt_path.find_last_of("\\/");
+    std::string dir = (pos_sep != std::string::npos) ? txt_path.substr(0, pos_sep + 1) : std::string();
+    std::string file = (pos_sep != std::string::npos) ? txt_path.substr(pos_sep + 1) : txt_path;
+    size_t dot = file.find_last_of('.');
+    if (dot != std::string::npos && dot > 0) {
+        std::string ext = file.substr(dot);
+        if (ext == ".txt" || ext == ".TXT") {
+            return dir + file.substr(0, dot) + ".bin";
+        }
+    }
+    return dir + file + ".bin";
+}
+
+// auto-load base: try .bin first then txt
+static size_t load_base_vectors_auto(const std::string &base_txt_path, int expected_dim, size_t max_count,
+                                     std::vector<float> &out_flat, int &out_dim_actual) {
+    out_dim_actual = expected_dim;
+    std::vector<std::string> cands;
+    cands.emplace_back(replace_base_txt_with_bin(base_txt_path, "base.bin"));
+    cands.emplace_back("base.bin");
+    for (const auto &cand : cands) {
+        if (file_exists(cand)) {
+            int dim_rd = 0; size_t cnt = 0; std::vector<float> flat;
+            if (binio::read_vecbin(cand, dim_rd, cnt, flat)) {
+                if (expected_dim > 0 && dim_rd != expected_dim) {
+                    std::cerr << "[WARN] Dimension mismatch in bin (" << cand << "): " << dim_rd
+                              << " != expected " << expected_dim << ". Ignored.\n";
+                } else {
+                    if (max_count > 0 && cnt > max_count) cnt = max_count; // clipping not applied to data here
+                    out_flat.swap(flat);
+                    out_dim_actual = dim_rd;
+                    std::cerr << "Loaded base from bin: " << cand << ", N=" << cnt << ", dim=" << dim_rd << "\n";
+                    return cnt;
+                }
+            }
+        }
+    }
+    size_t read = load_flat_vectors_from_txt(base_txt_path, expected_dim, max_count, out_flat);
+    out_dim_actual = expected_dim;
+    return read;
+}
+
+// auto-load queries .bin -> vector<vector<float>>, fallback to txt
+static size_t load_queries_auto(const std::string &base_txt_path, int expected_dim, size_t max_queries,
+                                std::vector<std::vector<float>> &out_queries,
+                                const std::string &override_path = std::string()) {
+    if (!override_path.empty()) {
+        // caller handles override text path loading separately
+        return 0;
+    }
+    std::vector<std::string> cands;
+    if (!base_txt_path.empty()) {
+        size_t pos_sep = base_txt_path.find_last_of("\\/");
+        if (pos_sep != std::string::npos) cands.emplace_back(base_txt_path.substr(0, pos_sep + 1) + "query.bin");
+        size_t pos = base_txt_path.find("base.txt");
+        if (pos != std::string::npos) cands.emplace_back(base_txt_path.substr(0, pos) + "query.bin");
+    }
+    cands.emplace_back("query.bin");
+    for (const auto &cand : cands) {
+        if (file_exists(cand)) {
+            std::vector<std::vector<float>> qs;
+            if (binio::read_queries_vecbin(cand, expected_dim, max_queries, qs)) {
+                out_queries.swap(qs);
+                std::cerr << "Loaded queries from bin: " << cand << ", count=" << out_queries.size() << ", dim=" << expected_dim << "\n";
+                return out_queries.size();
+            }
+        }
+    }
+    // 回退到 txt，成功后写出同目录的 query.bin
+    std::string used_txt;
+    size_t read = load_queries_from_txt(base_txt_path, expected_dim, max_queries, out_queries, &used_txt);
+    if (read > 0 && !used_txt.empty()) {
+        std::string qbin = derive_bin_path_from_txt(used_txt);
+        binio::write_queries_vecbin(qbin, expected_dim, out_queries);
+    }
+    return read;
 }
 
 // 读取数据集信息
@@ -134,7 +238,8 @@ static size_t load_flat_vectors_from_txt(const std::string &path, int dim, size_
 }
 
 // 读取查询向量文件
-static size_t load_queries_from_txt(const std::string &base_path, int dim, size_t max_queries, std::vector<std::vector<float>> &out_queries) {
+static size_t load_queries_from_txt(const std::string &base_path, int dim, size_t max_queries, std::vector<std::vector<float>> &out_queries, std::string* used_txt_path) {
+    if (used_txt_path) *used_txt_path = "";
     out_queries.clear();
 
     // 1) try parent_dir/query.txt
@@ -161,6 +266,7 @@ static size_t load_queries_from_txt(const std::string &base_path, int dim, size_
                     }
                 }
                 if (ENABLE_PROGRESS) progress_bar("Loading queries", out_queries.size(), out_queries.size(), start_tp);
+                if (used_txt_path) *used_txt_path = cand;
                 return out_queries.size();
             }
         }
@@ -182,6 +288,7 @@ static size_t load_queries_from_txt(const std::string &base_path, int dim, size_
                     if (row.size() == (size_t)dim) out_queries.push_back(std::move(row));
                 }
                 if (ENABLE_PROGRESS) progress_bar("Loading queries", out_queries.size(), out_queries.size(), start_tp);
+                if (used_txt_path) *used_txt_path = cand;
                 return out_queries.size();
             }
         }
@@ -190,9 +297,17 @@ static size_t load_queries_from_txt(const std::string &base_path, int dim, size_
     // 3) current working directory
     {
         std::vector<std::string> cands;
+        // default
         cands.emplace_back(QUERYFILEPATH);
         cands.emplace_back(std::string(".\\") + QUERYFILEPATH);
         cands.emplace_back(std::string("./") + QUERYFILEPATH);
+        // dataset-case friendly fallbacks in cwd
+        cands.emplace_back("query0.txt");
+        cands.emplace_back(".\\query0.txt");
+        cands.emplace_back("./query0.txt");
+        cands.emplace_back("query1.txt");
+        cands.emplace_back(".\\query1.txt");
+        cands.emplace_back("./query1.txt");
         for (const auto &cand : cands) {
             if (file_exists(cand)) {
                 std::ifstream ifs(cand);
@@ -207,6 +322,7 @@ static size_t load_queries_from_txt(const std::string &base_path, int dim, size_
                     if (row.size() == (size_t)dim) out_queries.push_back(std::move(row));
                 }
                 if (ENABLE_PROGRESS) progress_bar("Loading queries", out_queries.size(), out_queries.size(), start_tp);
+                if (used_txt_path) *used_txt_path = cand;
                 return out_queries.size();
             }
         }
@@ -293,6 +409,9 @@ int main(int argc, char** argv) {
     size_t firstN = 0; // 0 = evaluate all
     std::string algo = "solution"; // solution | brute | hnsw
     std::string query_override;     // optional custom query file path
+    bool save_bin_base = false;
+    
+    bool force_bin = false;         // 仅从 .bin 读取
 
     // Parse args
     auto is_unsigned_integer = [](const std::string &s) -> bool {
@@ -326,6 +445,10 @@ int main(int argc, char** argv) {
             query_override = argv[++i];
         } else if (a.rfind("--query=", 0) == 0) {
             query_override = a.substr(8);
+        } else if (a == "--save-bin-base") {
+            save_bin_base = true;
+        } else if (a == "--bin") {
+            force_bin = true;
         }
     }
 
@@ -354,7 +477,31 @@ int main(int argc, char** argv) {
     size_t loaded = 0;
     const size_t max_load = pointsnum;
     if (!filePath.empty() && file_exists(filePath)) {
-        loaded = load_flat_vectors_from_txt(filePath, dim, max_load, base_data);
+        if (force_bin) {
+            std::vector<std::string> cands;
+            cands.emplace_back(replace_base_txt_with_bin(filePath, "base.bin"));
+            cands.emplace_back("base.bin");
+            bool ok = false;
+            for (const auto &cand : cands) {
+                if (file_exists(cand)) {
+                    int dim_rd = 0; size_t cnt = 0; std::vector<float> flat;
+                    if (binio::read_vecbin(cand, dim_rd, cnt, flat)) {
+                        base_data.swap(flat);
+                        dim = dim_rd; loaded = cnt; ok = true;
+                        std::cerr << "Loaded base (bin forced): " << cand << ", N=" << loaded << ", dim=" << dim << "\n";
+                        break;
+                    }
+                }
+            }
+            if (!ok) {
+                std::cerr << "[ERROR] --bin specified, but base bin not found or invalid." << std::endl;
+                return 1;
+            }
+        } else {
+            int actual_dim = dim;
+            loaded = load_base_vectors_auto(filePath, dim, max_load, base_data, actual_dim);
+            dim = actual_dim;
+        }
     }
     if (loaded == 0) {
         size_t N = std::min<size_t>(pointsnum ? pointsnum : 1000, 1000);
@@ -367,33 +514,81 @@ int main(int argc, char** argv) {
         std::cerr << "Using synthetic base with N=" << N << " dim=" << dim << std::endl;
     } else {
         std::cerr << "Loaded base: N=" << loaded << " dim=" << dim << std::endl;
+        if (save_bin_base) {
+            std::string bbin = replace_base_txt_with_bin(filePath, "base.bin");
+            if (binio::write_vecbin(bbin, dim, base_data)) {
+                std::cerr << "Saved base to bin: " << bbin << " (N=" << (base_data.size()/(size_t)dim) << ")\n";
+            }
+        }
     }
 
     // Load queries
     std::vector<std::vector<float>> queries;
     size_t qloaded = 0;
     if (!query_override.empty()) {
-        std::ifstream qf(query_override);
-        if (!qf.is_open()) {
-            std::cerr << "[ERROR] Cannot open query file: " << query_override << std::endl;
-            return 1;
+        if (force_bin) {
+            // 强制从 override 路径按 .bin 读取
+            if (!binio::read_queries_vecbin(query_override, dim, gt.num, queries)) {
+                std::cerr << "[ERROR] --bin specified, but override query bin invalid: " << query_override << std::endl;
+                return 1;
+            }
+            qloaded = queries.size();
+            std::cerr << "Loaded queries (bin forced override): " << query_override << ", count=" << qloaded << std::endl;
+        } else {
+            std::ifstream qf(query_override);
+            if (!qf.is_open()) {
+                std::cerr << "[ERROR] Cannot open query file: " << query_override << std::endl;
+                return 1;
+            }
+            std::string qline;
+            while (queries.size() < gt.num && std::getline(qf, qline)) {
+                if (qline.empty()) continue;
+                std::istringstream ss(qline);
+                std::vector<float> row; float v;
+                while (row.size() < (size_t)dim && ss >> v) row.push_back(v);
+                if (row.size() == (size_t)dim) queries.push_back(std::move(row));
+            }
+            qloaded = queries.size();
+            std::cerr << "Loaded queries from override file: " << query_override << ", count=" << qloaded << std::endl;
+            if (qloaded > 0) {
+                std::string qbin = derive_bin_path_from_txt(query_override);
+                binio::write_queries_vecbin(qbin, dim, queries);
+            }
         }
-        std::string qline;
-        while (queries.size() < gt.num && std::getline(qf, qline)) {
-            if (qline.empty()) continue;
-            std::istringstream ss(qline);
-            std::vector<float> row; float v;
-            while (row.size() < (size_t)dim && ss >> v) row.push_back(v);
-            if (row.size() == (size_t)dim) queries.push_back(std::move(row));
-        }
-        qloaded = queries.size();
-        std::cerr << "Loaded queries from override file: " << query_override << ", count=" << qloaded << std::endl;
     } else {
-        qloaded = load_queries_from_txt(filePath, dim, gt.num, queries);
+        if (force_bin) {
+            std::vector<std::string> qcands;
+            if (!filePath.empty()) {
+                size_t pos_sep = filePath.find_last_of("\\/");
+                if (pos_sep != std::string::npos) qcands.emplace_back(filePath.substr(0, pos_sep + 1) + "query.bin");
+                size_t pos = filePath.find("base.txt");
+                if (pos != std::string::npos) qcands.emplace_back(filePath.substr(0, pos) + "query.bin");
+            }
+            qcands.emplace_back("query.bin");
+            bool ok = false;
+            for (const auto &cand : qcands) {
+                if (file_exists(cand)) {
+                    std::vector<std::vector<float>> qs;
+                    if (binio::read_queries_vecbin(cand, dim, gt.num, qs)) {
+                        queries.swap(qs);
+                        qloaded = queries.size(); ok = true;
+                        std::cerr << "Loaded queries (bin forced): " << cand << ", count=" << qloaded << std::endl;
+                        break;
+                    }
+                }
+            }
+            if (!ok) {
+                std::cerr << "[ERROR] --bin specified, but query bin not found or invalid." << std::endl;
+                return 1;
+            }
+        } else {
+            qloaded = load_queries_auto(filePath, dim, gt.num, queries);
+        }
     }
     if (qloaded < gt.num) {
         std::cerr << "Warning: queries loaded (" << qloaded << ") < ground-truth num (" << gt.num << ")" << std::endl;
     }
+    // 不再在此处额外生成 query.bin；若从文本读取会在读取阶段自动生成一次
     size_t num_to_eval = std::min<size_t>(gt.num, queries.size());
     if (firstN > 0) num_to_eval = std::min(num_to_eval, firstN);
     if (num_to_eval == 0) { std::cerr << "No queries to evaluate" << std::endl; return 1; }
