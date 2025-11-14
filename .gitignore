@@ -6,6 +6,7 @@
 
 // 查询文件
 query*.txt
+query*.bin
 
 // 答案文件
 ans*.txt
