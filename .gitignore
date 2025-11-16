@@ -22,3 +22,6 @@ Config.h
 cpp/
 hnswlib/
 
+// 数据-论文文件
+PJ论文/
+data_o/

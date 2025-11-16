@@ -18,6 +18,26 @@
 #include <thread>
 #include <memory>
 
+// SIMD 指令集相关
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386) || defined(_M_IX86)
+#define SOLUTION_PLATFORM_X86 1
+#else
+#define SOLUTION_PLATFORM_X86 0
+#endif
+
+#if SOLUTION_PLATFORM_X86
+#    ifdef _MSC_VER
+#        include <intrin.h>
+#    endif
+#    include <immintrin.h>
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#define SOLUTION_SIMD_TARGET_ATTR(x) __attribute__((target(x)))
+#else
+#define SOLUTION_SIMD_TARGET_ATTR(x)
+#endif
+
 using namespace std;
 
 // HNSW
@@ -26,6 +46,267 @@ typedef pair<float, tableint> distPair; // 距离-节点ID对类型
 typedef unsigned int linklistsizeint; // 邻居数量类型
 typedef size_t labeltype;  // 标签类型
 typedef float dist_t;      // 距离类型
+
+// SIMD 支持检测
+#if SOLUTION_PLATFORM_X86 && (defined(__GNUC__) || defined(__clang__))
+#define SOLUTION_COMPILE_AVX512 1
+#define SOLUTION_COMPILE_AVX 1
+#define SOLUTION_COMPILE_SSE3 1
+#define SOLUTION_COMPILE_SSE 1
+#else
+#if SOLUTION_PLATFORM_X86 && defined(__AVX512F__)
+#define SOLUTION_COMPILE_AVX512 1
+#else
+#define SOLUTION_COMPILE_AVX512 0
+#endif
+#if SOLUTION_PLATFORM_X86 && defined(__AVX__)
+#define SOLUTION_COMPILE_AVX 1
+#else
+#define SOLUTION_COMPILE_AVX 0
+#endif
+#if SOLUTION_PLATFORM_X86
+#define SOLUTION_COMPILE_SSE3 1
+#define SOLUTION_COMPILE_SSE 1
+#else
+#define SOLUTION_COMPILE_SSE3 0
+#define SOLUTION_COMPILE_SSE 0
+#endif
+#endif
+
+namespace simd_detail {
+inline dist_t l2_distance_scalar(const float* a, const float* b, size_t dim) {
+    dist_t dist = 0.0f;
+    for (size_t i = 0; i < dim; ++i) {
+        dist_t diff = a[i] - b[i];
+        dist += diff * diff;
+    }
+    return dist;
+}
+
+#if SOLUTION_PLATFORM_X86
+
+// SIMD 调度结构体
+struct SimdDispatch {
+    using Kernel = dist_t (*)(const float*, const float*, size_t);
+    Kernel kernel{l2_distance_scalar};
+    bool has_avx512{false};
+    bool has_avx{false};
+    bool has_sse3{false};
+    bool has_sse{false};
+};
+
+inline unsigned long long read_xcr0() {
+#if defined(_MSC_VER)
+    return _xgetbv(0);
+#elif defined(__GNUC__) || defined(__clang__)
+    unsigned int eax = 0, edx = 0;
+    __asm__ volatile(".byte 0x0f, 0x01, 0xd0" : "=a"(eax), "=d"(edx) : "c"(0));
+    return (static_cast<unsigned long long>(edx) << 32) | eax;
+#else
+    return 0ull;
+#endif
+}
+
+inline void cpuid_basic(int info[4], int func_id) {
+#if defined(_MSC_VER)
+    __cpuid(info, func_id);
+#elif defined(__GNUC__) || defined(__clang__)
+    int a = 0, b = 0, c = 0, d = 0;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(func_id), "c"(0));
+    info[0] = a;
+    info[1] = b;
+    info[2] = c;
+    info[3] = d;
+#else
+    info[0] = info[1] = info[2] = info[3] = 0;
+#endif
+}
+
+inline void cpuid_subfunction(int info[4], int func_id, int sub_func) {
+#if defined(_MSC_VER)
+    __cpuidex(info, func_id, sub_func);
+#elif defined(__GNUC__) || defined(__clang__)
+    int a = 0, b = 0, c = 0, d = 0;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(func_id), "c"(sub_func));
+    info[0] = a;
+    info[1] = b;
+    info[2] = c;
+    info[3] = d;
+#else
+    info[0] = info[1] = info[2] = info[3] = 0;
+#endif
+}
+
+#if SOLUTION_COMPILE_AVX512
+SOLUTION_SIMD_TARGET_ATTR("avx512f")
+inline dist_t l2_distance_avx512(const float* a, const float* b, size_t dim) {
+    __m512 acc = _mm512_setzero_ps();
+    size_t i = 0;
+    size_t bound = dim & (~size_t(15));
+    for (; i < bound; i += 16) {
+        __m512 va = _mm512_loadu_ps(a + i);
+        __m512 vb = _mm512_loadu_ps(b + i);
+        __m512 diff = _mm512_sub_ps(va, vb);
+        acc = _mm512_add_ps(acc, _mm512_mul_ps(diff, diff));
+    }
+    dist_t sum = _mm512_reduce_add_ps(acc);
+    for (; i < dim; ++i) {
+        dist_t diff = a[i] - b[i];
+        sum += diff * diff;
+    }
+    return sum;
+}
+#endif
+
+#if SOLUTION_COMPILE_AVX
+SOLUTION_SIMD_TARGET_ATTR("avx")
+inline dist_t l2_distance_avx(const float* a, const float* b, size_t dim) {
+    __m256 acc = _mm256_setzero_ps();
+    size_t i = 0;
+    size_t bound = dim & (~size_t(7));
+    for (; i < bound; i += 8) {
+        __m256 va = _mm256_loadu_ps(a + i);
+        __m256 vb = _mm256_loadu_ps(b + i);
+        __m256 diff = _mm256_sub_ps(va, vb);
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(diff, diff));
+    }
+    alignas(32) float buffer[8];
+    _mm256_store_ps(buffer, acc);
+    dist_t sum = buffer[0] + buffer[1] + buffer[2] + buffer[3] +
+                 buffer[4] + buffer[5] + buffer[6] + buffer[7];
+    for (; i < dim; ++i) {
+        dist_t diff = a[i] - b[i];
+        sum += diff * diff;
+    }
+    return sum;
+}
+#endif
+
+#if SOLUTION_COMPILE_SSE3
+SOLUTION_SIMD_TARGET_ATTR("sse3")
+inline dist_t l2_distance_sse3(const float* a, const float* b, size_t dim) {
+    __m128 acc = _mm_setzero_ps();
+    size_t i = 0;
+    size_t bound = dim & (~size_t(3));
+    for (; i < bound; i += 4) {
+        __m128 va = _mm_loadu_ps(a + i);
+        __m128 vb = _mm_loadu_ps(b + i);
+        __m128 diff = _mm_sub_ps(va, vb);
+        acc = _mm_add_ps(acc, _mm_mul_ps(diff, diff));
+    }
+    acc = _mm_hadd_ps(acc, acc);
+    acc = _mm_hadd_ps(acc, acc);
+    dist_t sum = _mm_cvtss_f32(acc);
+    for (; i < dim; ++i) {
+        dist_t diff = a[i] - b[i];
+        sum += diff * diff;
+    }
+    return sum;
+}
+#endif
+
+#if SOLUTION_COMPILE_SSE
+SOLUTION_SIMD_TARGET_ATTR("sse2")
+inline dist_t l2_distance_sse(const float* a, const float* b, size_t dim) {
+    __m128 acc = _mm_setzero_ps();
+    size_t i = 0;
+    size_t bound = dim & (~size_t(3));
+    for (; i < bound; i += 4) {
+        __m128 va = _mm_loadu_ps(a + i);
+        __m128 vb = _mm_loadu_ps(b + i);
+        __m128 diff = _mm_sub_ps(va, vb);
+        acc = _mm_add_ps(acc, _mm_mul_ps(diff, diff));
+    }
+    alignas(16) float buffer[4];
+    _mm_store_ps(buffer, acc);
+    dist_t sum = buffer[0] + buffer[1] + buffer[2] + buffer[3];
+    for (; i < dim; ++i) {
+        dist_t diff = a[i] - b[i];
+        sum += diff * diff;
+    }
+    return sum;
+}
+#endif
+
+inline SimdDispatch init_dispatch() {
+    SimdDispatch dispatch;
+    int info[4] = {0, 0, 0, 0};
+    cpuid_basic(info, 0);
+    int max_func = info[0];
+    bool osxsave = false;
+
+    if (max_func >= 1) {
+        cpuid_basic(info, 1);
+        dispatch.has_sse = (info[3] & (1 << 25)) != 0;
+        dispatch.has_sse3 = dispatch.has_sse && ((info[2] & 1) != 0);
+        osxsave = (info[2] & (1 << 27)) != 0;
+        bool hw_avx = (info[2] & (1 << 28)) != 0;
+        if (hw_avx && osxsave) {
+            unsigned long long mask = read_xcr0();
+            if ((mask & 0x6) == 0x6) {
+                dispatch.has_avx = true;
+            }
+        }
+    }
+
+    if (max_func >= 7) {
+        cpuid_subfunction(info, 7, 0);
+        bool hw_avx512 = (info[1] & (1 << 16)) != 0;
+        if (hw_avx512 && osxsave) {
+            unsigned long long mask = read_xcr0();
+            if ((mask & 0xE6ull) == 0xE6ull) {
+                dispatch.has_avx512 = true;
+            }
+        }
+    }
+
+#if SOLUTION_COMPILE_AVX512
+    if (dispatch.has_avx512) {
+        dispatch.kernel = l2_distance_avx512;
+        return dispatch;
+    }
+#endif
+#if SOLUTION_COMPILE_AVX
+    if (dispatch.has_avx) {
+        dispatch.kernel = l2_distance_avx;
+        return dispatch;
+    }
+#endif
+#if SOLUTION_COMPILE_SSE3
+    if (dispatch.has_sse3) {
+        dispatch.kernel = l2_distance_sse3;
+        return dispatch;
+    }
+#endif
+#if SOLUTION_COMPILE_SSE
+    if (dispatch.has_sse) {
+        dispatch.kernel = l2_distance_sse;
+        return dispatch;
+    }
+#endif
+
+    dispatch.kernel = l2_distance_scalar;
+    return dispatch;
+}
+
+inline const SimdDispatch& get_dispatch() {
+    static const SimdDispatch dispatch = init_dispatch();
+    return dispatch;
+}
+
+inline dist_t compute(const float* a, const float* b, size_t dim) {
+    return get_dispatch().kernel(a, b, dim);
+}
+
+#else // SOLUTION_PLATFORM_X86
+
+inline dist_t compute(const float* a, const float* b, size_t dim) {
+    return l2_distance_scalar(a, b, dim);
+}
+
+#endif // SOLUTION_PLATFORM_X86
+
+} // namespace simd_detail
 
 
 class Solution {
@@ -206,12 +487,9 @@ public:
 
     // 欧式距离
     dist_t L2Distance(const void * a, const void * b) const {
-        dist_t dist = 0.0f;
-        for(size_t i = 0; i < dim_; ++i){
-            dist_t diff = ((float*)a)[i] - ((float*)b)[i];
-            dist += diff * diff;
-        }
-        return dist;
+        const float* lhs = static_cast<const float*>(a);
+        const float* rhs = static_cast<const float*>(b);
+        return simd_detail::compute(lhs, rhs, static_cast<size_t>(dim_));
     }
 
     // 优先队列比较器，按照距离从小到大排序
