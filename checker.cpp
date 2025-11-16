@@ -603,6 +603,9 @@ int main(int argc, char** argv) {
         Solution sol;
         auto t_build_start = std::chrono::high_resolution_clock::now();
         sol.build(dim, base_data);
+        if(ENABLE_PROGRESS) {
+            progress_bar("Building index", 1, 1, t_build_start);
+        }
         auto t_build_end = std::chrono::high_resolution_clock::now();
 
         auto t0 = std::chrono::high_resolution_clock::now();

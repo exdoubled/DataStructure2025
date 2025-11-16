@@ -32,21 +32,20 @@ void Solution::search(const vector<float>& query, int *res) {
         res[i] = static_cast<int>(id);
     }
     
-    /*
-    qbuf_.resize(dim_);
-    memcpy(qbuf_.data(), query.data(), sizeof(float) * dim_);
+    
+    // qbuf_.resize(dim_);
+    // memcpy(qbuf_.data(), query.data(), sizeof(float) * dim_);
 
-    auto pq = searchKnn((const void*)qbuf_.data(), k);
+    // auto pq = searchKnn((const void*)qbuf_.data(), k);
 
-    std::vector<distPair> buf;
-    buf.reserve(pq.size());
-    while (!pq.empty()) { buf.push_back(pq.top()); pq.pop(); }
-    std::reverse(buf.begin(), buf.end());
+    // std::vector<distPair> buf;
+    // buf.reserve(pq.size());
+    // while (!pq.empty()) { buf.push_back(pq.top()); pq.pop(); }
+    // std::reverse(buf.begin(), buf.end());
 
-    size_t i = 0;
-    for (; i < buf.size() && i < k; ++i) res[i] = (int)buf[i].second;
-    for (; i < k; ++i) res[i] = -1;
-    */
+    // size_t i = 0;
+    // for (; i < buf.size() && i < k; ++i) res[i] = (int)buf[i].second;
+    // for (; i < k; ++i) res[i] = -1;
 }
 
 /*

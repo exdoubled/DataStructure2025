@@ -651,6 +651,9 @@ int main(int argc, char** argv) {
         // Build
         auto start1 = std::chrono::high_resolution_clock::now();
         solution.build(dim, base_data);
+        if(ENABLE_PROGRESS) {
+            progress_bar("Building", N, N, start1);
+        }
         auto end1 = std::chrono::high_resolution_clock::now();
         build_duration = end1 - start1;
         if (ENABLE_PROGRESS) std::cerr << "[Progress] Build done in " 

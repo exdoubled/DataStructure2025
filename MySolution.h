@@ -109,10 +109,9 @@ public:
         mult_ = 1 / log(1.0 * M_);
         reverse_size_ = 1.0 / mult_;
 
-        // 修复#3：初始化/扩容层数记录
+        // 层数记录
         element_levels_.assign(max_elements_, 0);
 
-        // 修复#4：初始化入口点为“无”，最高层设为 -1
         enterpoint_node_ = static_cast<tableint>(-1);
         maxlevel_ = -1;
 
@@ -196,12 +195,16 @@ public:
 
     // 产生指数分布的层数
     int generateRandomLevel(double reverse_size){
+        /*
         uniform_real_distribution<float> distribution(0.0f, 1.0f);
         float r = distribution(level_generator_);
         // 避免 r=0 导致 -log(0) 造成层数极大并引发巨额分配
         r = std::min(0.999999f, std::max(r, 1e-6f));
         double level = -log(r) * reverse_size;
         return (int)level;
+        */
+       // 我真服了去掉这个随机化还变快了
+       return 0;
     }
 
     // 在指定层搜索，返回至多 ef_limit 个近邻节点
@@ -436,7 +439,7 @@ public:
             if (!linkLists_[cur_c]) throw std::runtime_error("malloc high level list failed");
             memset(linkLists_[cur_c], 0, bytes);
         }
-        // 初始化节点相关数据结构：仅清零第0层链表头与邻接区，避免不必要的大块清零
+        // 初始化节点相关数据结构
         // memset(get_linklist0(static_cast<tableint>(cur_c)), 0, size_links_level0_);
         // memcpy(getDataByInternalId(cur_c), vec, data_size_);
         
@@ -449,7 +452,7 @@ public:
         //     memset(linkLists_[cur_c], 0, size_links_per_element_ * curlevel);
         // }
 
-        //  空图场景，设置入口点并返回
+        //  空图，设置入口点并返回
         if (enterpoint_node_ == static_cast<tableint>(-1)) {
             enterpoint_node_ = static_cast<tableint>(cur_c);
             maxlevel_ = curlevel;
