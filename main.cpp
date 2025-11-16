@@ -16,21 +16,20 @@
 #include <string>
 #include <random>
 #include <fstream>
+#include <cstdlib>
 #include <sstream>
 #include <cctype>
 #include <cmath>
 #include <iomanip>
 #include <mutex>
+#include <thread>
+#include <cstdio>
 
 #include "MySolution.h"
 #include "Brute.h"
 #include "Config.h"
 #include "BinaryIO.h"
-// 部分 MinGW 发行版（win32 线程模型）可能缺失 _GLIBCXX_HAS_GTHREAD，导致 std::mutex 在编译期被禁用。
-// 为保证单线程/仿真环境下能编译通过，这里做与 checker.cpp 相同的兜底处理：
-#if !defined(_GLIBCXX_HAS_GTHREAD)
-namespace std { class mutex { public: void lock() {} void unlock() {} }; }
-#endif
+
 #include "hnswlib/hnswlib.h"
 
 // ---- Runtime knobs (easy to tweak) ----
@@ -651,6 +650,12 @@ int main(int argc, char** argv) {
         // Build
         auto start1 = std::chrono::high_resolution_clock::now();
         solution.build(dim, base_data);
+#ifdef CPP_SOLUTION_FAKE_STD_SYNC
+        std::fprintf(stderr, "[main] threading disabled (fallback)\n");
+#else
+        std::fprintf(stderr, "[main] threading enabled, worker_count=%zu (hc=%u)\n",
+                     solution.worker_count_, std::thread::hardware_concurrency());
+#endif
         if(ENABLE_PROGRESS) {
             progress_bar("Building", N, N, start1);
         }

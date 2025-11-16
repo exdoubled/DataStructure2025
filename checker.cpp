@@ -35,19 +35,13 @@
 #include <unordered_set>
 #include <vector>
 #include <mutex>
+#include <thread>
+#include <cstdio>
 
 #include "MySolution.h"
 #include "Config.h"
 #include "Brute.h"
 #include "BinaryIO.h"
-
-// MinGW 8.1 (win32 线程模型) 可能缺失 _GLIBCXX_HAS_GTHREAD，导致 std::mutex 未定义。
-// 如果检测到该宏缺失，提供一个空实现，只用于单线程调用，避免修改 hnswlib 其它逻辑。
-#if !defined(_GLIBCXX_HAS_GTHREAD)
-namespace std {
-    class mutex { public: void lock() {} void unlock() {} };
-}
-#endif
 
 #include "hnswlib/hnswlib.h"
 
@@ -603,6 +597,12 @@ int main(int argc, char** argv) {
         Solution sol;
         auto t_build_start = std::chrono::high_resolution_clock::now();
         sol.build(dim, base_data);
+    #ifdef CPP_SOLUTION_FAKE_STD_SYNC
+        std::fprintf(stderr, "[checker] threading disabled (fallback)\n");
+    #else
+        std::fprintf(stderr, "[checker] threading enabled, worker_count=%zu (hc=%u)\n",
+                 sol.worker_count_, std::thread::hardware_concurrency());
+    #endif
         if(ENABLE_PROGRESS) {
             progress_bar("Building index", 1, 1, t_build_start);
         }

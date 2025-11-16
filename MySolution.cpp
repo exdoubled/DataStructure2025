@@ -1,4 +1,6 @@
 #include "MySolution.h"
+#include <thread>
+#include <atomic>
 
 // hnsw
 
@@ -7,12 +9,42 @@ void Solution::build(int d, const vector<float>& base) {
     data_size_ = (size_t)dim_ * sizeof(float);  // 数据向量大小
 
     size_t n = base.size() / (size_t)dim_;  // 数据点数量
-    // 分别代表：max_elements, M, random_seed, ef_construction, ef, data_size
-    initHNSW(n, 16, 100, 200, 350,  data_size_);
+    
+    size_t worker_count = min(std::thread::hardware_concurrency(), 64u); // 多线程线程数
 
-    for (size_t i = 0; i < n; ++i) {
-        const void* vec = (const void*)(&base[i * dim_]);
-        insert(vec, -1, (labeltype)i);
+    // 分别代表：max_elements, M, random_seed, ef_construction, ef, data_size, worker_count
+    initHNSW(n, 16, 100, 200, 350, data_size_, worker_count);
+
+    
+
+
+    // 单线程插入
+    if (worker_count_ == 1) {
+        for (size_t i = 0; i < n; ++i) {
+            const void* vec = static_cast<const void*>(&base[i * dim_]);
+            insert(vec, -1, static_cast<labeltype>(i));
+        }
+        return;
+    }
+
+    // 多线程插入
+    std::atomic<size_t> next_index{0};
+    auto worker = [this, &base, n, &next_index]() {
+        while (true) {
+            size_t idx = next_index.fetch_add(1, std::memory_order_relaxed);
+            if (idx >= n) break;
+            const void* vec = static_cast<const void*>(&base[idx * dim_]);
+            insert(vec, -1, static_cast<labeltype>(idx));
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(worker_count_);
+    for (size_t t = 0; t < worker_count_; ++t) {
+        threads.emplace_back(worker);
+    }
+    for (auto &th : threads) {
+        th.join();
     }
 }
 
