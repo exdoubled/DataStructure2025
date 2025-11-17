@@ -10,7 +10,7 @@ void Solution::build(int d, const vector<float>& base) {
 
     size_t n = base.size() / (size_t)dim_;  // 数据点数量
     
-    size_t worker_count = min(std::thread::hardware_concurrency(), 64u); // 多线程线程数
+    size_t worker_count = min(std::thread::hardware_concurrency(), 32u); // 多线程线程数
 
     // 分别代表：max_elements, M, random_seed, ef_construction, ef, data_size, worker_count
     initHNSW(n, 16, 100, 200, 350, data_size_, worker_count);
@@ -24,6 +24,7 @@ void Solution::build(int d, const vector<float>& base) {
             const void* vec = static_cast<const void*>(&base[i * dim_]);
             insert(vec, -1, static_cast<labeltype>(i));
         }
+        seal();
         return;
     }
 
@@ -46,6 +47,7 @@ void Solution::build(int d, const vector<float>& base) {
     for (auto &th : threads) {
         th.join();
     }
+    seal();
 }
 
 void Solution::search(const vector<float>& query, int *res) {
@@ -63,7 +65,6 @@ void Solution::search(const vector<float>& query, int *res) {
         tableint id = buf[i].second;
         res[i] = static_cast<int>(id);
     }
-    
     
     // qbuf_.resize(dim_);
     // memcpy(qbuf_.data(), query.data(), sizeof(float) * dim_);
