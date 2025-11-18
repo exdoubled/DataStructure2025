@@ -13,7 +13,7 @@ void Solution::build(int d, const vector<float>& base) {
     size_t worker_count = min(std::thread::hardware_concurrency(), 32u); // 多线程线程数
 
     // 分别代表：max_elements, M, random_seed, ef_construction, ef, data_size, worker_count
-    initHNSW(n, 16, 100, 200, 350, data_size_, worker_count);
+    initHNSW(n, 16, 114514, 200, 350, data_size_, worker_count);
 
     
 

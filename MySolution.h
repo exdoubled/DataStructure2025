@@ -341,8 +341,8 @@ public:
     size_t maxM0_{0};        // 每个节点第 0 层最大连接数
     size_t ef_construction_{0}; // 构建时候选列表大小
     size_t ef_{0};            // 查询时候选列表大小
-    double reverse_size_{0.0};   // 论文中的 m_l
-    double mult_{0.0};          // 计算随机层数的参数
+    double reverse_size_{0.0};   // ln(M)
+    double mult_{0.0};          // 论文中的 m_l
     int dim_{0};
 
     size_t data_size_{0}; // 数据向量大小
@@ -630,6 +630,7 @@ public:
 
 
     // 启发式寻找 M 个邻居
+    // 寻找到的邻居存回 topCandidates 中
     // 这里和论文的 Algorithm 4 实现不一样
     void selectNeighborsHeuristic(
         priority_queue<distPair, vector<distPair>, CompareDist>& topCandidates,
@@ -694,11 +695,8 @@ public:
             selectNeighbors.push_back(top_candidates.top().second);
             top_candidates.pop();
         }
-
-        // 若无可选邻居，直接返回自身以避免未定义行为
-        if (selectNeighbors.empty()) {
-            return cur_c;
-        }
+        
+        tableint next_close_ep = selectNeighbors.back();
 
         // 新节点写入本层的邻接
         // 使用锁保护，确保并发插入时的线程安全
@@ -711,11 +709,12 @@ public:
             setListCount(ll_new, static_cast<unsigned short>(write_cnt));
         }
 
-        tableint next_close_ep = selectNeighbors.back();
+        
 
         for(size_t idx = 0; idx < selectNeighbors.size(); idx++){
             tableint neighbor_id = selectNeighbors[idx];
             std::lock_guard<std::mutex> other_lock(link_list_locks_[neighbor_id]);
+            
             linklistsizeint *ll_other = get_linklist_at_level(neighbor_id, level);
 
             size_t sz_link_list_other = getListCount(ll_other);
