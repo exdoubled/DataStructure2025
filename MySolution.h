@@ -8,6 +8,7 @@
 #include <cmath>
 #include <queue>
 #include <climits>
+#include <limits>
 #include <unordered_set>
 #include <random>
 #include <cstring>
@@ -17,6 +18,7 @@
 #include <mutex>
 #include <thread>
 #include <memory>
+#include <type_traits>
 
 // SIMD 指令集相关
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386) || defined(_M_IX86)
@@ -39,6 +41,7 @@
 #endif
 
 using namespace std;
+/*
 
 // HNSW
 typedef unsigned int tableint;   // unsigned 和 float 都是 4 字节 
@@ -502,15 +505,13 @@ public:
 
     // 产生指数分布的层数
     int generateRandomLevel(double reverse_size){
-        /*
-        uniform_real_distribution<float> distribution(0.0f, 1.0f);
-        float r = distribution(level_generator_);
+        
+        // uniform_real_distribution<float> distribution(0.0f, 1.0f);
+        // float r = distribution(level_generator_);
         // 避免 r=0 导致 -log(0) 造成层数极大并引发巨额分配
-        r = std::min(0.999999f, std::max(r, 1e-6f));
-        double level = -log(r) * reverse_size;
-        return (int)level;
-        */
-       // 我真服了去掉这个随机化还变快了
+        // r = std::min(0.999999f, std::max(r, 1e-6f));
+        // double level = -log(r) * reverse_size;
+        // return (int)level;
        return 0;
     }
 
@@ -760,11 +761,11 @@ public:
             size_t bytes = size_links_per_element_ * curlevel;
             linkLists_[cur_c] = (char*)malloc(bytes);
             if (!linkLists_[cur_c]) throw std::runtime_error("malloc high level list failed");
-            memset(linkLists_[cur_c], 0, bytes);/*
-            for (int lvl = 1; lvl <= curlevel; ++lvl) {
-                linklistsizeint* lvl_head = get_linklist_at_level(cur_c, lvl);
-                setListCount(lvl_head, 0);
-            }*/
+            memset(linkLists_[cur_c], 0, bytes);
+            // for (int lvl = 1; lvl <= curlevel; ++lvl) {
+            //     linklistsizeint* lvl_head = get_linklist_at_level(cur_c, lvl);
+            //     setListCount(lvl_head, 0);
+            // }
         }
         // 初始化节点相关数据结构
         // memset(get_linklist0(static_cast<tableint>(cur_c)), 0, size_links_level0_);
@@ -896,9 +897,8 @@ public:
 
 
 };
+*/
 
-
-/*
 // kmeans
 
 typedef vector<float> V;
@@ -921,9 +921,53 @@ public:
     V base_; // size = n_points_ * dim_
     vector<vector<size_t>> cluster_members_;
 
-    vector<V> center_distances_;
+    // 簇中心两两之间的距离矩阵，center_distances_[i][j]
+    vector<vector<float>> center_distances_;
+    // 默认在若干个最近的簇中搜索，可以按需要调整
     int search_clusters_ = 5;
 
+    size_t max_parallel_workers_{[]() {
+        size_t hw = std::thread::hardware_concurrency();
+        if (hw == 0) hw = 4;
+        size_t capped = std::min<size_t>(hw, 16);
+        return std::max<size_t>(size_t(1), capped);
+    }()};
+
+    template <typename Func>
+    size_t parallelFor(size_t total, Func&& func) const {
+        if (total == 0) {
+            func(0, 0, 0);
+            return 1;
+        }
+
+        using FuncType = typename std::decay<Func>::type;
+        auto func_ptr = std::make_shared<FuncType>(std::forward<Func>(func));
+
+        size_t workers = std::min(max_parallel_workers_, std::max<size_t>(size_t(1), total));
+        if (workers <= 1) {
+            (*func_ptr)(0, total, 0);
+            return 1;
+        }
+
+        size_t base = total / workers;
+        size_t remainder = total % workers;
+        std::vector<std::thread> threads;
+        threads.reserve(workers - 1);
+        size_t begin = 0;
+        for (size_t t = 0; t + 1 < workers; ++t) {
+            size_t chunk = base + (t < remainder ? 1 : 0);
+            size_t end = begin + chunk;
+            threads.emplace_back([func_ptr, begin, end, t]() {
+                (*func_ptr)(begin, end, t);
+            });
+            begin = end;
+        }
+        (*func_ptr)(begin, total, workers - 1);
+        for (auto& th : threads) {
+            if (th.joinable()) th.join();
+        }
+        return workers;
+    }
 
     dist_t L2Distance(const V& a, const V& b) const {
         dist_t dist = 0.0f;
@@ -935,168 +979,206 @@ public:
     }
 
     void initKmeans(const vector<Point>& points, size_t n, size_t K) {
-        K_ = K;
+        if (n == 0) {
+            K_ = 0;
+            centroids_.clear();
+            cluster_members_.clear();
+            center_distances_.clear();
+            return;
+        }
+
+        K_ = std::max<size_t>(1, std::min(K, n));
         centroids_.clear();
         cluster_members_.clear();
-        
-        // Kmeans++
-        mt19937 gen(random_device{}());
+        center_distances_.clear();
         centroids_.reserve(K_);
 
-        if (!points.empty()) {
-        // 第一个中心随机选择
-        uniform_int_distribution<size_t> dist(0, n - 1);
-        size_t first_idx = dist(gen);
+        mt19937 gen(random_device{}());
+        uniform_int_distribution<size_t> initial_pick(0, n - 1);
+        size_t first_idx = initial_pick(gen);
         centroids_.emplace_back(points[first_idx].value, points[first_idx].id);
-        
-        // 选择剩余的中心
-        for (size_t k = 1; k < K_; ++k) {
-            vector<float> distances;
-            distances.reserve(n);
-            
-            // 计算每个点到最近中心的距离
-            for (const auto& point : points) {
-                float min_dist = numeric_limits<float>::max();
-                for (const auto& center : centroids_) {
-                    float dist = L2Distance(point.value, center.value);
-                    if (dist < min_dist) {
-                        min_dist = dist;
+
+        vector<float> min_dists(n, numeric_limits<float>::max());
+        auto update_min_dists = [&](const V& new_center) {
+            parallelFor(n, [&](size_t begin, size_t end, size_t) {
+                for (size_t i = begin; i < end; ++i) {
+                    float dist = L2Distance(points[i].value, new_center);
+                    if (dist < min_dists[i]) {
+                        min_dists[i] = dist;
                     }
                 }
-                distances.push_back(min_dist);
-            }
-            
-            // 根据距离的平方作为概率选择下一个中心
-            vector<float> probabilities;
-            probabilities.reserve(n);
-            float total = 0.0f;
-            for (float dist : distances) {
-                float prob = dist * dist;
-                probabilities.push_back(prob);
-                total += prob;
-            }
-            
-            // 归一化
-            for (float& prob : probabilities) {
-                prob /= total;
-            }
-            
-            // 轮盘赌选择
-            uniform_real_distribution<float> real_dist(0.0f, 1.0f);
-            float r = real_dist(gen);
-            float cumulative = 0.0f;
-            size_t selected_idx = 0;
-            for (size_t i = 0; i < n; ++i) {
-                cumulative += probabilities[i];
-                if (r <= cumulative) {
-                    selected_idx = i;
-                    break;
+            });
+        };
+
+        update_min_dists(centroids_.back().value);
+
+        for (size_t k = 1; k < K_; ++k) {
+            vector<double> partial_sums(max_parallel_workers_, 0.0);
+            size_t used_workers = parallelFor(n, [&](size_t begin, size_t end, size_t worker_idx) {
+                double local = 0.0;
+                for (size_t i = begin; i < end; ++i) {
+                    double weight = static_cast<double>(min_dists[i]);
+                    local += weight * weight;
                 }
+                partial_sums[worker_idx] = local;
+            });
+
+            double total = 0.0;
+            for (size_t idx = 0; idx < used_workers; ++idx) {
+                total += partial_sums[idx];
             }
-            
+
+            size_t selected_idx = first_idx;
+            if (total > numeric_limits<double>::epsilon()) {
+                uniform_real_distribution<double> real_dist(0.0, total);
+                double r = real_dist(gen);
+                double cumulative = 0.0;
+                for (size_t i = 0; i < n; ++i) {
+                    double weight = static_cast<double>(min_dists[i]);
+                    cumulative += weight * weight;
+                    if (r <= cumulative) {
+                        selected_idx = i;
+                        break;
+                    }
+                }
+            } else {
+                selected_idx = initial_pick(gen);
+            }
+
             centroids_.emplace_back(points[selected_idx].value, points[selected_idx].id);
-            }
+            update_min_dists(centroids_.back().value);
         }
 
-    const int max_iters = 20;
-    const float convergence_threshold = 1e-6f;
-    vector<vector<size_t>> current_clusters;
-    
-    for (int iter = 0; iter < max_iters; ++iter) {
-        current_clusters.assign(K_, vector<size_t>());
-        
-        // 分配点到最近的聚类中心
-        for (const auto& point : points) {
-            float min_dist = L2Distance(point.value, centroids_[0].value);
-            size_t best_cluster = 0;
-            for (size_t c = 1; c < K_; ++c) {
-                float dist = L2Distance(point.value, centroids_[c].value);
-                if (dist < min_dist) {
-                    min_dist = dist;
-                    best_cluster = c;
-                }
-            }
-            current_clusters[best_cluster].push_back(point.id);
-        }
-        // 修复4：改进空簇处理
-        bool has_empty_cluster = false;
-        for (size_t c = 0; c < K_; ++c) {
-            if (current_clusters[c].empty()) {
-                has_empty_cluster = true;
-                // 选择距离当前所有中心最远的点作为新中心
-                float max_min_dist = -1.0f;
-                size_t farthest_point_idx = 0;
-                
-                for (size_t i = 0; i < n; ++i) {
-                    float min_dist_to_centers = numeric_limits<float>::max();
-                    for (size_t other_c = 0; other_c < K_; ++other_c) {
-                        if (other_c == c) continue;
-                        float dist = L2Distance(points[i].value, centroids_[other_c].value);
-                        if (dist < min_dist_to_centers) {
-                            min_dist_to_centers = dist;
+        const int max_iters = 20;
+        const float convergence_threshold = 1e-6f;
+        vector<vector<size_t>> current_clusters;
+        vector<size_t> assignments(n, 0);
+
+        for (int iter = 0; iter < max_iters; ++iter) {
+            current_clusters.assign(K_, vector<size_t>());
+
+            parallelFor(n, [&](size_t begin, size_t end, size_t) {
+                for (size_t i = begin; i < end; ++i) {
+                    float min_dist = L2Distance(points[i].value, centroids_[0].value);
+                    size_t best_cluster = 0;
+                    for (size_t c = 1; c < K_; ++c) {
+                        float dist = L2Distance(points[i].value, centroids_[c].value);
+                        if (dist < min_dist) {
+                            min_dist = dist;
+                            best_cluster = c;
                         }
                     }
-                    if (min_dist_to_centers > max_min_dist) {
-                        max_min_dist = min_dist_to_centers;
-                        farthest_point_idx = i;
+                    assignments[i] = best_cluster;
+                }
+            });
+
+            for (size_t i = 0; i < n; ++i) {
+                current_clusters[assignments[i]].push_back(points[i].id);
+            }
+
+            bool has_empty_cluster = false;
+            for (size_t c = 0; c < K_; ++c) {
+                if (current_clusters[c].empty()) {
+                    has_empty_cluster = true;
+                    float max_min_dist = -1.0f;
+                    size_t farthest_point_idx = 0;
+                    for (size_t i = 0; i < n; ++i) {
+                        float min_dist_to_centers = numeric_limits<float>::max();
+                        for (size_t other_c = 0; other_c < K_; ++other_c) {
+                            if (other_c == c) continue;
+                            float dist = L2Distance(points[i].value, centroids_[other_c].value);
+                            if (dist < min_dist_to_centers) {
+                                min_dist_to_centers = dist;
+                            }
+                        }
+                        if (min_dist_to_centers > max_min_dist) {
+                            max_min_dist = min_dist_to_centers;
+                            farthest_point_idx = i;
+                        }
+                    }
+                    centroids_[c].value = points[farthest_point_idx].value;
+                    centroids_[c].id = points[farthest_point_idx].id;
+                }
+            }
+
+            if (has_empty_cluster) {
+                continue;
+            }
+
+            vector<vector<float>> local_sums(max_parallel_workers_, vector<float>(K_ * dim_, 0.0f));
+            vector<vector<size_t>> local_counts(max_parallel_workers_, vector<size_t>(K_, 0));
+            size_t used_workers = parallelFor(n, [&](size_t begin, size_t end, size_t worker_id) {
+                auto& sum = local_sums[worker_id];
+                auto& count = local_counts[worker_id];
+                for (size_t idx = begin; idx < end; ++idx) {
+                    size_t cluster_id = assignments[idx];
+                    ++count[cluster_id];
+                    float* sum_ptr = sum.data() + cluster_id * dim_;
+                    const V& vec = points[idx].value;
+                    for (size_t d = 0; d < dim_; ++d) {
+                        sum_ptr[d] += vec[d];
                     }
                 }
-                
-                centroids_[c].value = points[farthest_point_idx].value;
-                centroids_[c].id = points[farthest_point_idx].id;
-            }
-        }
-        
-        // 如果有空簇，重新进行分配
-        if (has_empty_cluster) {
-            continue;
-        }
-        
-        // 更新聚类中心并检查收敛
-        bool converged = true;
-        for (size_t c = 0; c < K_; ++c) {
-            V new_centroid(dim_, 0.0f);
-            for (const auto pid : current_clusters[c]) {
-                // 注意：这里假设pid是points的索引
-                for (size_t d = 0; d < dim_; ++d) {
-                    new_centroid[d] += points[pid].value[d];
+            });
+
+            vector<size_t> counts(K_, 0);
+            vector<float> global_sums(K_ * dim_, 0.0f);
+            for (size_t worker = 0; worker < used_workers; ++worker) {
+                const auto& sum = local_sums[worker];
+                const auto& count = local_counts[worker];
+                for (size_t c = 0; c < K_; ++c) {
+                    counts[c] += count[c];
+                    float* global_ptr = global_sums.data() + c * dim_;
+                    const float* local_ptr = sum.data() + c * dim_;
+                    for (size_t d = 0; d < dim_; ++d) {
+                        global_ptr[d] += local_ptr[d];
+                    }
                 }
             }
-            for (size_t d = 0; d < dim_; ++d) {
-                new_centroid[d] /= static_cast<float>(current_clusters[c].size());
-            }
-            
-            // 检查是否收敛
-            float center_move_dist = 0.0f;
-            for (size_t d = 0; d < dim_; ++d) {
-                float diff = new_centroid[d] - centroids_[c].value[d];
-                center_move_dist += diff * diff;
-            }
-            
-            if (center_move_dist > convergence_threshold) {
-                converged = false;
-            }
-            
-            centroids_[c].value = std::move(new_centroid);
-        }
-        
-        // 如果收敛，提前结束
-        if (converged && iter >= 5) {  // 至少迭代5次
-            break;
-        }
-    }
-    cluster_members_ = std::move(current_clusters);
 
+            bool converged = true;
+            for (size_t c = 0; c < K_; ++c) {
+                if (counts[c] == 0) {
+                    converged = false;
+                    continue;
+                }
 
-    center_distances_.resize(K_, vector<float>(K_, 0.0));
-    for (size_t i = 0; i < K_; ++i) {
-        for (size_t j = i + 1; j < K_; ++j) {
-            double dist = sqrt(L2Distance(centroids_[i].value, centroids_[j].value));
-            center_distances_[i][j] = dist;
-            center_distances_[j][i] = dist;
+                V new_centroid(dim_, 0.0f);
+                const float* sum_ptr = global_sums.data() + c * dim_;
+                for (size_t d = 0; d < dim_; ++d) {
+                    new_centroid[d] = sum_ptr[d] / static_cast<float>(counts[c]);
+                }
+
+                float center_move_dist = 0.0f;
+                for (size_t d = 0; d < dim_; ++d) {
+                    float diff = new_centroid[d] - centroids_[c].value[d];
+                    center_move_dist += diff * diff;
+                }
+                if (center_move_dist > convergence_threshold) {
+                    converged = false;
+                }
+
+                centroids_[c].value = std::move(new_centroid);
+            }
+
+            if (converged && iter >= 5) {
+                break;
+            }
         }
+
+        cluster_members_ = std::move(current_clusters);
+
+        center_distances_.assign(K_, vector<float>(K_, 0.0f));
+        parallelFor(K_, [&](size_t begin, size_t end, size_t) {
+            for (size_t i = begin; i < end; ++i) {
+                for (size_t j = i + 1; j < K_; ++j) {
+                    float dist = std::sqrt(L2Distance(centroids_[i].value, centroids_[j].value));
+                    center_distances_[i][j] = dist;
+                    center_distances_[j][i] = dist;
+                }
+            }
+        });
     }
-}
 
     // 找到查询点最近的簇
     int findNearestCluster(const V& query) const {
@@ -1183,6 +1265,8 @@ public:
     void search(const vector<float>& query, int *res);
 
 };
-*/
+
+
+
 
 #endif //CPP_SOLUTION_H

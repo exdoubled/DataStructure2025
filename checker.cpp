@@ -641,12 +641,12 @@ int main(int argc, char** argv) {
         Solution sol;
         auto t_build_start = std::chrono::high_resolution_clock::now();
         sol.build(dim, base_data);
-    #ifdef CPP_SOLUTION_FAKE_STD_SYNC
-        std::fprintf(stderr, "[checker] threading disabled (fallback)\n");
-    #else
-        std::fprintf(stderr, "[checker] threading enabled, worker_count=%zu (hc=%u)\n",
-                 sol.worker_count_, std::thread::hardware_concurrency());
-    #endif
+    //#ifdef CPP_SOLUTION_FAKE_STD_SYNC
+    //    std::fprintf(stderr, "[checker] threading disabled (fallback)\n");
+    //#else
+    //    std::fprintf(stderr, "[checker] threading enabled, worker_count=%zu (hc=%u)\n",
+    //             sol.worker_count_, std::thread::hardware_concurrency());
+    //#endif
         if(ENABLE_PROGRESS) {
             progress_bar("Building index", 1, 1, t_build_start);
         }

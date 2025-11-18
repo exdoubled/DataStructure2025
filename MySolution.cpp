@@ -1,7 +1,7 @@
 #include "MySolution.h"
 #include <thread>
 #include <atomic>
-
+/*
 // hnsw
 
 void Solution::build(int d, const vector<float>& base) {
@@ -13,7 +13,7 @@ void Solution::build(int d, const vector<float>& base) {
     size_t worker_count = min(std::thread::hardware_concurrency(), 64u); // 多线程线程数
 
     // 分别代表：max_elements, M, random_seed, ef_construction, ef, data_size, worker_count
-    initHNSW(n, 16, 114514, 200, 350, data_size_, worker_count);
+    initHNSW(n, 16, 114514, 500, 3600, data_size_, worker_count);
 
     
 
@@ -79,8 +79,8 @@ void Solution::search(const vector<float>& query, int *res) {
     // for (; i < buf.size() && i < k; ++i) res[i] = (int)buf[i].second;
     // for (; i < k; ++i) res[i] = -1;
 }
+*/
 
-/*
 // kmeans
 
 void Solution::build(int d, const vector<float>& base) {
@@ -96,10 +96,9 @@ void Solution::build(int d, const vector<float>& base) {
         V vec(base.begin() + i * dim_, base.begin() + (i + 1) * dim_);
         points.emplace_back(vec, i);
     }
-        
-        // 自适应确定聚类数
-    size_t adaptive_K = min(size_t(10), max(size_t(2), n / 100));
-    initKmeans(points, n, adaptive_K);
+    
+    // 点集合， 点数量， 聚类数目
+    initKmeans(points, n, 1000);
 }
 
 void Solution::search(const vector<float>& query, int *res) {
@@ -130,4 +129,3 @@ void Solution::search(const vector<float>& query, int *res) {
             }
         }
 }
-*/
