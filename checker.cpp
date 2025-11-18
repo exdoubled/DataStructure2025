@@ -1,4 +1,4 @@
-// 编译：& 'C:/TDM-GCC-64/bin/g++.exe' -std=c++17 -O2 -Wall -Wextra -pthread -o './checker.exe' './checker.cpp' './MySolution.cpp' './Brute.cpp'
+// 编译：& "C:/mingw64/bin/g++.exe" -std=c++17 -O2 -Wall -Wextra -o ".\checker.exe" ".\checker.cpp" ".\MySolution.cpp" ".\Brute.cpp"
 
 /*
 主要作用是使用暴力解对拍 MySolution 和 Brute 的结果，确保两者一致
@@ -154,23 +154,15 @@ static size_t load_queries_auto(const std::string &base_txt_path, int expected_d
         // caller handles override text path loading separately
         return 0;
     }
-    // 先查找与 QUERYFILEPATH 对应的 .bin（如 query0.bin）
-    std::vector<std::string> cands_qbin;
-    const std::string qbin_name = derive_bin_path_from_txt(QUERYFILEPATH);
+    std::vector<std::string> cands;
     if (!base_txt_path.empty()) {
         size_t pos_sep = base_txt_path.find_last_of("\\/");
-        if (pos_sep != std::string::npos) {
-            const std::string dir = base_txt_path.substr(0, pos_sep + 1);
-            cands_qbin.emplace_back(dir + qbin_name);
-        }
+        if (pos_sep != std::string::npos) cands.emplace_back(base_txt_path.substr(0, pos_sep + 1) + "query.bin");
         size_t pos = base_txt_path.find("base.txt");
-        if (pos != std::string::npos) {
-            const std::string dir2 = base_txt_path.substr(0, pos);
-            cands_qbin.emplace_back(dir2 + qbin_name);
-        }
+        if (pos != std::string::npos) cands.emplace_back(base_txt_path.substr(0, pos) + "query.bin");
     }
-    cands_qbin.emplace_back(qbin_name);
-    for (const auto &cand : cands_qbin) {
+    cands.emplace_back("query.bin");
+    for (const auto &cand : cands) {
         if (file_exists(cand)) {
             std::vector<std::vector<float>> qs;
             if (binio::read_queries_vecbin(cand, expected_dim, max_queries, qs)) {
@@ -180,40 +172,14 @@ static size_t load_queries_auto(const std::string &base_txt_path, int expected_d
             }
         }
     }
-    // 若没有匹配到 query0.bin，则优先从 QUERYFILEPATH 文本读取并写出同名 .bin
+    // 回退到 txt，成功后写出同目录的 query.bin
     std::string used_txt;
     size_t read = load_queries_from_txt(base_txt_path, expected_dim, max_queries, out_queries, &used_txt);
     if (read > 0 && !used_txt.empty()) {
         std::string qbin = derive_bin_path_from_txt(used_txt);
         binio::write_queries_vecbin(qbin, expected_dim, out_queries);
-        return read;
     }
-    // 最后才兼容性回退到 "query.bin"
-    std::vector<std::string> cands_generic;
-    if (!base_txt_path.empty()) {
-        size_t pos_sep = base_txt_path.find_last_of("\\/");
-        if (pos_sep != std::string::npos) {
-            const std::string dir = base_txt_path.substr(0, pos_sep + 1);
-            cands_generic.emplace_back(dir + std::string("query.bin"));
-        }
-        size_t pos = base_txt_path.find("base.txt");
-        if (pos != std::string::npos) {
-            const std::string dir2 = base_txt_path.substr(0, pos);
-            cands_generic.emplace_back(dir2 + std::string("query.bin"));
-        }
-    }
-    cands_generic.emplace_back("query.bin");
-    for (const auto &cand : cands_generic) {
-        if (file_exists(cand)) {
-            std::vector<std::vector<float>> qs;
-            if (binio::read_queries_vecbin(cand, expected_dim, max_queries, qs)) {
-                out_queries.swap(qs);
-                std::cerr << "Loaded queries from bin: " << cand << ", count=" << out_queries.size() << ", dim=" << expected_dim << "\n";
-                return out_queries.size();
-            }
-        }
-    }
-    return 0;
+    return read;
 }
 
 // 读取数据集信息
@@ -586,22 +552,12 @@ int main(int argc, char** argv) {
     } else {
         if (force_bin) {
             std::vector<std::string> qcands;
-            const std::string qbin_name = derive_bin_path_from_txt(QUERYFILEPATH);
             if (!filePath.empty()) {
                 size_t pos_sep = filePath.find_last_of("\\/");
-                if (pos_sep != std::string::npos) {
-                    const std::string dir = filePath.substr(0, pos_sep + 1);
-                    qcands.emplace_back(dir + qbin_name);
-                    qcands.emplace_back(dir + std::string("query.bin"));
-                }
+                if (pos_sep != std::string::npos) qcands.emplace_back(filePath.substr(0, pos_sep + 1) + "query.bin");
                 size_t pos = filePath.find("base.txt");
-                if (pos != std::string::npos) {
-                    const std::string dir2 = filePath.substr(0, pos);
-                    qcands.emplace_back(dir2 + qbin_name);
-                    qcands.emplace_back(dir2 + std::string("query.bin"));
-                }
+                if (pos != std::string::npos) qcands.emplace_back(filePath.substr(0, pos) + "query.bin");
             }
-            qcands.emplace_back(qbin_name);
             qcands.emplace_back("query.bin");
             bool ok = false;
             for (const auto &cand : qcands) {
