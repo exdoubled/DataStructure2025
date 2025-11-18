@@ -13,7 +13,6 @@
 #include <cstring>
 #include <utility>
 #include <cstddef>
-#include <cstdint>
 #include <atomic>
 #include <mutex>
 #include <thread>
@@ -329,10 +328,6 @@ public:
 
     std::vector<int> element_levels_; // 保持每个节点的层数
     mutable std::unique_ptr<std::mutex[]> link_list_locks_; // 每个节点的邻接锁，支持并发构建/查询
-    std::atomic<bool> finished_build_{false}; // 构建完成后无需锁读邻接
-
-    mutable std::unique_ptr<std::atomic<uint32_t>[]> visit_epoch_; // 访问标记
-    mutable std::atomic<uint32_t> global_visit_epoch_{1};   
 
     size_t max_elements_{0}; // 最大节点数量
     std::atomic<size_t> cur_element_count{0}; // 当前节点数量
@@ -406,13 +401,6 @@ public:
         element_levels_.assign(max_elements_, 0);
 
         link_list_locks_.reset(new std::mutex[max_elements_]);
-        finished_build_.store(false, std::memory_order_relaxed);
-
-        visit_epoch_.reset(new std::atomic<uint32_t>[max_elements_]);
-        for (size_t i = 0; i < max_elements_; ++i) {
-            visit_epoch_[i].store(0u, std::memory_order_relaxed);
-        }
-        global_visit_epoch_.store(1u, std::memory_order_relaxed);
 
         enterpoint_node_.store(static_cast<tableint>(-1), std::memory_order_relaxed);
         maxlevel_.store(-1, std::memory_order_relaxed);
@@ -435,29 +423,6 @@ public:
         maxlevel_.store(-1, std::memory_order_relaxed);
         has_enterpoint_.store(false, std::memory_order_relaxed);
         link_list_locks_.reset();
-        finished_build_.store(false, std::memory_order_relaxed);
-        visit_epoch_.reset();
-        global_visit_epoch_.store(1u, std::memory_order_relaxed);
-    }
-
-    inline void seal() {
-        finished_build_.store(true, std::memory_order_release);
-    }
-
-    // 获取下一个访问标记
-    inline uint32_t nextVisitToken() const {
-        uint32_t token = global_visit_epoch_.fetch_add(1u, std::memory_order_acq_rel);
-        if (token == 0u) {
-            auto *self = const_cast<Solution*>(this);
-            if (!self->visit_epoch_) {
-                return 1u;
-            }
-            for (size_t i = 0; i < max_elements_; ++i) {
-                self->visit_epoch_[i].store(0u, std::memory_order_relaxed);
-            }
-            token = global_visit_epoch_.fetch_add(1u, std::memory_order_acq_rel);
-        }
-        return token;
     }
 
 
@@ -505,30 +470,19 @@ public:
 
     // 使用锁保护，确保并发插入时的线程安全
     void collectNeighbors(tableint id, int level, std::vector<tableint>& out) const {
-        if (id >= max_elements_) {
+        if (!link_list_locks_ || id >= max_elements_) {
             out.clear();
             return;
         }
-        auto read_neighbors = [this, id, level, &out]() {
-            if (level > element_levels_[id]) {
-                out.clear();
-                return;
-            }
-            linklistsizeint *header = get_linklist_at_level(id, level);
-            int size = getListCount(header);
-            tableint *data = getNeighborsArray(header);
-            out.assign(data, data + size);
-        };
-        if (!finished_build_.load(std::memory_order_acquire)) {
-            if (!link_list_locks_) {
-                out.clear();
-                return;
-            }
-            std::lock_guard<std::mutex> guard(link_list_locks_[id]);
-            read_neighbors();
-        } else {
-            read_neighbors();
+        std::lock_guard<std::mutex> guard(link_list_locks_[id]);
+        if (level > element_levels_[id]) {
+            out.clear();
+            return;
         }
+        linklistsizeint *header = get_linklist_at_level(id, level);
+        int size = getListCount(header);
+        tableint *data = getNeighborsArray(header);
+        out.assign(data, data + size);
     }
 
     // 欧式距离
@@ -548,12 +502,16 @@ public:
 
     // 产生指数分布的层数
     int generateRandomLevel(double reverse_size){
+        /*
         uniform_real_distribution<float> distribution(0.0f, 1.0f);
         float r = distribution(level_generator_);
         // 避免 r=0 导致 -log(0) 造成层数极大并引发巨额分配
         r = std::min(0.999999f, std::max(r, 1e-6f));
         double level = -log(r) * reverse_size;
         return (int)level;
+        */
+       // 我真服了去掉这个随机化还变快了
+       return 0;
     }
 
     // 在指定层搜索，返回至多 ef_limit 个近邻节点
@@ -571,17 +529,20 @@ public:
 
         lowerBound = dist;
 
-        if (!visit_epoch_) {
-            auto *self = const_cast<Solution*>(this);
-            self->visit_epoch_.reset(new std::atomic<uint32_t>[max_elements_]);
-            for (size_t i = 0; i < max_elements_; ++i) {
-                self->visit_epoch_[i].store(0u, std::memory_order_relaxed);
-            }
-            global_visit_epoch_.store(1u, std::memory_order_relaxed);
+        // 多线程实现，使用 thread_local 变量避免竞争
+        thread_local std::vector<uint32_t> visit_mark_tls;
+        thread_local uint32_t visit_token_tls = 1u;
+        if (visit_mark_tls.size() < max_elements_) {
+            visit_mark_tls.assign(max_elements_, 0u);
         }
-
-        uint32_t token = nextVisitToken();
-        visit_epoch_[ep_id].store(token, std::memory_order_relaxed);
+        visit_token_tls += 1u;
+        if (visit_token_tls == 0u) {
+            std::fill(visit_mark_tls.begin(), visit_mark_tls.end(), 0u);
+            visit_token_tls = 1u;
+        }
+        uint32_t token = visit_token_tls;
+        auto &mark = visit_mark_tls;
+        mark[ep_id] = token;
 
         thread_local std::vector<tableint> neighbors_tls;
         auto &neighbors = neighbors_tls;
@@ -598,16 +559,10 @@ public:
             tableint curID = currPair.second;
             collectNeighbors(curID, layer, neighbors);
 
-            for (size_t idx = 0; idx < neighbors.size(); ++idx) {
-                tableint candidateID = neighbors[idx];
-                if (visit_epoch_[candidateID].load(std::memory_order_relaxed) == token) continue;
-                visit_epoch_[candidateID].store(token, std::memory_order_relaxed);
+            for(tableint candidateID : neighbors){
 
-#if SOLUTION_PLATFORM_X86
-                if (idx + 1 < neighbors.size()) {
-                    _mm_prefetch(reinterpret_cast<const char*>(getDataByInternalId(neighbors[idx + 1])), _MM_HINT_T0);
-                }
-#endif
+                if(mark[candidateID] == token) continue;
+                mark[candidateID] = token;
 
                 dist_t d = L2Distance(query, getDataByInternalId(candidateID));
 
