@@ -10,19 +10,16 @@ void Solution::build(int d, const vector<float>& base) {
 
     size_t n = base.size() / (size_t)dim_;  // 数据点数量
     
-    size_t worker_count = min(std::thread::hardware_concurrency(), 64u); // 多线程线程数
+    size_t worker_count = min(std::thread::hardware_concurrency(), 32u); // 多线程线程数
 
     // 分别代表：max_elements, M, random_seed, ef_construction, ef, data_size, worker_count
-    initHNSW(n, 16, 114514, 500, 3600, data_size_, worker_count);
-
-    
-
+    initHNSW(n, 16, 114514, 200, 350, data_size_, worker_count);
 
     // 单线程插入
     if (worker_count_ == 1) {
         for (size_t i = 0; i < n; ++i) {
             const void* vec = static_cast<const void*>(&base[i * dim_]);
-            insert(vec, -1, static_cast<labeltype>(i));
+            insert(vec, -1);
         }
         return;
     }
@@ -34,7 +31,7 @@ void Solution::build(int d, const vector<float>& base) {
             size_t idx = next_index.fetch_add(1, std::memory_order_relaxed);
             if (idx >= n) break;
             const void* vec = static_cast<const void*>(&base[idx * dim_]);
-            insert(vec, -1, static_cast<labeltype>(idx));
+            insert(vec, -1);
         }
     };
 
@@ -63,21 +60,6 @@ void Solution::search(const vector<float>& query, int *res) {
         tableint id = buf[i].second;
         res[i] = static_cast<int>(id);
     }
-    
-    
-    // qbuf_.resize(dim_);
-    // memcpy(qbuf_.data(), query.data(), sizeof(float) * dim_);
-
-    // auto pq = searchKnn((const void*)qbuf_.data(), k);
-
-    // std::vector<distPair> buf;
-    // buf.reserve(pq.size());
-    // while (!pq.empty()) { buf.push_back(pq.top()); pq.pop(); }
-    // std::reverse(buf.begin(), buf.end());
-
-    // size_t i = 0;
-    // for (; i < buf.size() && i < k; ++i) res[i] = (int)buf[i].second;
-    // for (; i < k; ++i) res[i] = -1;
 }
 
 /*

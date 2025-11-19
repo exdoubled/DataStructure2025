@@ -9,7 +9,6 @@
 #include <queue>
 #include <climits>
 #include <limits>
-#include <unordered_set>
 #include <random>
 #include <cstring>
 #include <utility>
@@ -18,7 +17,6 @@
 #include <mutex>
 #include <thread>
 #include <memory>
-#include <type_traits>
 
 // SIMD 指令集相关
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386) || defined(_M_IX86)
@@ -47,7 +45,6 @@ using namespace std;
 typedef unsigned int tableint;   // unsigned 和 float 都是 4 字节 
 typedef pair<float, tableint> distPair; // 距离-节点ID对类型
 typedef unsigned int linklistsizeint; // 邻居数量类型
-typedef size_t labeltype;  // 标签类型
 typedef float dist_t;      // 距离类型
 
 // SIMD 支持检测
@@ -333,13 +330,12 @@ public:
     mutable std::unique_ptr<std::mutex[]> link_list_locks_; // 每个节点的邻接锁，支持并发构建/查询
 
     size_t max_elements_{0}; // 最大节点数量
-    std::atomic<size_t> cur_element_count{0}; // 当前节点数量
     size_t M_{0};               // 每个节点最大连接数
     size_t maxM_{0};           // 每个节点第 1 层及以上最大连接数
     size_t maxM0_{0};        // 每个节点第 0 层最大连接数
     size_t ef_construction_{0}; // 构建时候选列表大小
     size_t ef_{0};            // 查询时候选列表大小
-    double reverse_size_{0.0};   // ln(M)
+
     double mult_{0.0};          // 论文中的 m_l
     int dim_{0};
 
@@ -347,15 +343,15 @@ public:
     size_t size_links_level0_{0}; // 第 0 层每个节点链接大小
     size_t size_data_per_element_{0}; // 每个节点数据大小
     size_t size_links_per_element_{0}; // 每个节点第 1 层及以上链接大小
-    size_t offsetData_{0}, offsetLevel0_{0}, offsetLable_{0}; // 偏移量
+    size_t offsetData_{0}, offsetLevel0_{0}; // 偏移量
 
     std::atomic<tableint> enterpoint_node_{static_cast<tableint>(-1)};  // 并行构建时的入口点
     std::atomic<int> maxlevel_{-1}; // 当前最大层数
     std::atomic<bool> has_enterpoint_{false}; // 并行构建时是否已有入口点
+    std::atomic<size_t> cur_element_count{0}; // 当前节点数量
     size_t worker_count_{0}; // 构建时的工作线程数
 
     std::default_random_engine level_generator_; // 用于生成随机层数
-    vector<float> qbuf_;
 
     void initHNSW(
         size_t max_elements,
@@ -378,14 +374,14 @@ public:
 
 
         size_links_level0_ = maxM0_ * sizeof(tableint) + sizeof(linklistsizeint);
-        size_data_per_element_ = size_links_level0_ + data_size_ + sizeof(labeltype);
-        offsetData_ = size_links_level0_;
-        offsetLable_ = size_links_level0_ + data_size_;
         offsetLevel0_ = 0;
+        offsetData_ = offsetLevel0_ + size_links_level0_;
+        size_data_per_element_ = size_links_level0_ + data_size_;
 
         data_level0_memory_ = (char *) malloc(max_elements_ * size_data_per_element_);
         if (data_level0_memory_ == nullptr)
             throw std::runtime_error("Not enough memory");
+        memset(data_level0_memory_, 0, max_elements_ * size_data_per_element_);
         
 
         linkLists_ = (char **) malloc(sizeof(void *) * max_elements_);
@@ -398,8 +394,6 @@ public:
         
         cur_element_count.store(0, std::memory_order_relaxed);
         mult_ = 1 / log(1.0 * M_);
-        reverse_size_ = 1.0 / mult_;
-
         // 层数记录
         element_levels_.assign(max_elements_, 0);
 
@@ -432,11 +426,6 @@ public:
     // 获取节点数据指针
     inline char *getDataByInternalId(tableint id) const {
         return (data_level0_memory_ + id * size_data_per_element_ + offsetData_);
-    }
-
-    // 获取节点标签指针
-    inline labeltype *getExternalLabelPtr(tableint id) const {
-        return (labeltype *) (data_level0_memory_ + id * size_data_per_element_ + offsetLable_);
     }
 
     // 获取第 0 层的邻居列表指针，不直接使用，需通过 get_linklist_at_level 调用
@@ -506,13 +495,13 @@ public:
     // 产生指数分布的层数
     int generateRandomLevel(double reverse_size){
         
-        // uniform_real_distribution<float> distribution(0.0f, 1.0f);
-        // float r = distribution(level_generator_);
+        uniform_real_distribution<float> distribution(0.0f, 1.0f);
+        float r = distribution(level_generator_);
         // 避免 r=0 导致 -log(0) 造成层数极大并引发巨额分配
-        // r = std::min(0.999999f, std::max(r, 1e-6f));
-        // double level = -log(r) * reverse_size;
-        // return (int)level;
-       return 0;
+        r = std::min(0.999999f, std::max(r, 1e-6f));
+        double level = -log(r) * reverse_size;
+        return (int)level;
+       // return 0;
     }
 
     // 在指定层搜索，返回至多 ef_limit 个近邻节点
@@ -636,8 +625,7 @@ public:
         const void * vec,
         tableint cur_c,
         priority_queue<distPair, vector<distPair>, CompareDist>& top_candidates,
-        int level,
-        bool isUpdate
+        int level
     ){
         size_t Mcurmax = level ? maxM_ : maxM0_;
         // 多线程实现，使用 thread_local 变量避免竞争
@@ -683,43 +671,31 @@ public:
                 throw std::runtime_error("Trying to make a link on a non-existent level");
             tableint *data = getNeighborsArray(ll_other);
 
-            bool is_cur_c_present = false;
-            if (isUpdate) {
+            if (sz_link_list_other < Mcurmax) {
+                data[sz_link_list_other] = cur_c;
+                setListCount(ll_other, sz_link_list_other + 1);
+            } else {
+                // finding the "weakest" element to replace it with the new one
+                dist_t d_max = L2Distance(getDataByInternalId(cur_c), getDataByInternalId(selectNeighbors[idx]));
+                // Heuristic:
+                priority_queue<distPair, vector<distPair>, CompareDist> candidates;
+                candidates.emplace(d_max, cur_c);
+
                 for (size_t j = 0; j < sz_link_list_other; j++) {
-                    if (data[j] == cur_c) {
-                        is_cur_c_present = true;
-                        break;
-                    }
+                    candidates.emplace(
+                            L2Distance(getDataByInternalId(data[j]), getDataByInternalId(selectNeighbors[idx])), data[j]);
                 }
-            }
 
-            if(!is_cur_c_present){
-                if (sz_link_list_other < Mcurmax) {
-                    data[sz_link_list_other] = cur_c;
-                    setListCount(ll_other, sz_link_list_other + 1);
-                } else {
-                    // finding the "weakest" element to replace it with the new one
-                    dist_t d_max = L2Distance(getDataByInternalId(cur_c), getDataByInternalId(selectNeighbors[idx]));
-                    // Heuristic:
-                    priority_queue<distPair, vector<distPair>, CompareDist> candidates;
-                    candidates.emplace(d_max, cur_c);
+                selectNeighborsHeuristic(candidates, Mcurmax);
 
-                    for (size_t j = 0; j < sz_link_list_other; j++) {
-                        candidates.emplace(
-                                L2Distance(getDataByInternalId(data[j]), getDataByInternalId(selectNeighbors[idx])), data[j]);
-                    }
-
-                    selectNeighborsHeuristic(candidates, Mcurmax);
-
-                    int indx = 0;
-                    while (candidates.size() > 0) {
-                        data[indx] = candidates.top().second;
-                        candidates.pop();
-                        indx++;
-                    }
-
-                    setListCount(ll_other, indx);
+                int indx = 0;
+                while (candidates.size() > 0) {
+                    data[indx] = candidates.top().second;
+                    candidates.pop();
+                    indx++;
                 }
+
+                setListCount(ll_other, indx);
             }
         }
         return next_close_ep;
@@ -728,7 +704,7 @@ public:
 
     // 把数据插入到多层图中
     // 并发插入：通过原子 ID 分配 + per-node 邻接锁，确保多个线程可以安全地同时写入图结构。
-    void insert(const void * vec, int level, labeltype label) {
+    void insert(const void * vec, int level) {
         size_t cur_c = cur_element_count.fetch_add(1, std::memory_order_acq_rel);
         if (cur_c >= max_elements_)
             throw std::runtime_error("HNSW capacity exceeded");
@@ -822,13 +798,13 @@ public:
                 for (int lvl = std::min(curlevel, maxLevelSnapshot); lvl >= 0; lvl--) {
                     auto top_candidates = searchLayer(currObj, vec, lvl, ef_construction_);
                     // 这里把 Algorithm 1 后面的部分 合并到连接邻居一起实现了
-                    currObj = mutuallyConnectNewElement(vec, static_cast<tableint>(cur_c), top_candidates, lvl, false);
+                    currObj = mutuallyConnectNewElement(vec, static_cast<tableint>(cur_c), top_candidates, lvl);
                 }
             } else {
                 tableint ep = enterpoint_copy;
                 for (int lvl = maxLevelSnapshot; lvl >= 0; --lvl) {
                     auto top_candidates = searchLayer(ep, vec, lvl, ef_construction_);
-                    ep = mutuallyConnectNewElement(vec, static_cast<tableint>(cur_c), top_candidates, lvl, false);
+                    ep = mutuallyConnectNewElement(vec, static_cast<tableint>(cur_c), top_candidates, lvl);
                 }
                 bool updated = false;
                 int expected = maxLevelSnapshot;
