@@ -75,12 +75,21 @@ typedef float dist_t;      // 距离类型
 
 namespace simd_detail {
 inline dist_t l2_distance_scalar(const float* a, const float* b, size_t dim) {
-    dist_t dist = 0.0f;
-    for (size_t i = 0; i < dim; ++i) {
-        dist_t diff = a[i] - b[i];
-        dist += diff * diff;
+    dist_t acc0 = 0.0f;
+    dist_t acc1 = 0.0f;
+    size_t i = 0;
+    size_t bound = dim & ~static_cast<size_t>(1);
+    for (; i < bound; i += 2) {
+        dist_t d0 = a[i]   - b[i];
+        dist_t d1 = a[i+1] - b[i+1];
+        acc0 += d0 * d0;
+        acc1 += d1 * d1;
     }
-    return dist;
+    for (; i < dim; ++i) {
+        dist_t d = a[i] - b[i];
+        acc0 += d * d;
+    }
+    return acc0 + acc1;
 }
 
 #if SOLUTION_PLATFORM_X86
@@ -170,10 +179,12 @@ inline dist_t l2_distance_avx(const float* a, const float* b, size_t dim) {
         __m256 diff = _mm256_sub_ps(va, vb);
         acc = _mm256_add_ps(acc, _mm256_mul_ps(diff, diff));
     }
-    alignas(32) float buffer[8];
-    _mm256_store_ps(buffer, acc);
-    dist_t sum = buffer[0] + buffer[1] + buffer[2] + buffer[3] +
-                 buffer[4] + buffer[5] + buffer[6] + buffer[7];
+    __m256 tmp = _mm256_hadd_ps(acc, acc);
+    tmp = _mm256_hadd_ps(tmp, tmp);
+    __m128 low  = _mm256_castps256_ps128(tmp);
+    __m128 high = _mm256_extractf128_ps(tmp, 1);
+    __m128 sum128 = _mm_add_ps(low, high);
+    dist_t sum = _mm_cvtss_f32(sum128);
     for (; i < dim; ++i) {
         dist_t diff = a[i] - b[i];
         sum += diff * diff;
@@ -337,7 +348,7 @@ public:
     size_t ef_{0};            // 查询时候选列表大小
 
     double mult_{0.0};          // 论文中的 m_l
-    int dim_{0};
+    size_t dim_{0};
 
     size_t data_size_{0}; // 数据向量大小
     size_t size_links_level0_{0}; // 第 0 层每个节点链接大小
@@ -424,8 +435,8 @@ public:
 
 
     // 获取节点数据指针
-    inline char *getDataByInternalId(tableint id) const {
-        return (data_level0_memory_ + id * size_data_per_element_ + offsetData_);
+    inline const float *getDataByInternalId(tableint id) const {
+        return reinterpret_cast<const float*>(data_level0_memory_ + id * size_data_per_element_ + offsetData_);
     }
 
     // 获取第 0 层的邻居列表指针，不直接使用，需通过 get_linklist_at_level 调用
@@ -478,10 +489,8 @@ public:
     }
 
     // 欧式距离
-    dist_t L2Distance(const void * a, const void * b) const {
-        const float* lhs = static_cast<const float*>(a);
-        const float* rhs = static_cast<const float*>(b);
-        return simd_detail::compute(lhs, rhs, static_cast<size_t>(dim_));
+    dist_t L2Distance(const float * a, const float * b) const {
+        return simd_detail::compute(a, b, dim_);
     }
 
     // 优先队列比较器，按照距离从小到大排序
@@ -507,7 +516,7 @@ public:
     // 在指定层搜索，返回至多 ef_limit 个近邻节点
     // 实现论文的 Algorithm 2，这里要求 query 是数据指针
     priority_queue<distPair, vector<distPair>, CompareDist> 
-    searchLayer(tableint ep_id, const void * query, int layer, size_t ef_limit) const {
+    searchLayer(tableint ep_id, const float *query, int layer, size_t ef_limit) const {
         priority_queue<distPair, vector<distPair>, CompareDist> top_candidates; // W
         priority_queue<distPair, vector<distPair>, CompareDist> candidate_set; // C
 
@@ -519,20 +528,45 @@ public:
 
         lowerBound = dist;
 
-        // 多线程实现，使用 thread_local 变量避免竞争
-        thread_local std::vector<uint32_t> visit_mark_tls;
+        // 多线程实现，使用 thread_local bitset + token，避免每次清空和大内存
+        thread_local std::vector<uint64_t> visit_bitmap_tls;
+        thread_local std::vector<uint32_t> visit_epoch_tls;
         thread_local uint32_t visit_token_tls = 1u;
-        if (visit_mark_tls.size() < max_elements_) {
-            visit_mark_tls.assign(max_elements_, 0u);
+
+        const size_t needed_words = (max_elements_ + 63ull) >> 6;
+        if (visit_bitmap_tls.size() < needed_words) {
+            visit_bitmap_tls.assign(needed_words, 0ull);
+            visit_epoch_tls.assign(needed_words, 0u);
+        } else if (visit_epoch_tls.size() < visit_bitmap_tls.size()) {
+            visit_epoch_tls.resize(visit_bitmap_tls.size(), 0u);
         }
+
         visit_token_tls += 1u;
         if (visit_token_tls == 0u) {
-            std::fill(visit_mark_tls.begin(), visit_mark_tls.end(), 0u);
+            std::fill(visit_epoch_tls.begin(), visit_epoch_tls.end(), 0u);
             visit_token_tls = 1u;
         }
-        uint32_t token = visit_token_tls;
-        auto &mark = visit_mark_tls;
-        mark[ep_id] = token;
+
+        auto touch_word = [&](size_t word_idx) {
+            if (visit_epoch_tls[word_idx] != visit_token_tls) {
+                visit_epoch_tls[word_idx] = visit_token_tls;
+                visit_bitmap_tls[word_idx] = 0ull;
+            }
+        };
+        auto mark_visited = [&](tableint id) {
+            size_t word = static_cast<size_t>(id) >> 6;
+            size_t bit = static_cast<size_t>(id) & 63ull;
+            touch_word(word);
+            visit_bitmap_tls[word] |= (1ull << bit);
+        };
+        auto is_visited = [&](tableint id) -> bool {
+            size_t word = static_cast<size_t>(id) >> 6;
+            size_t bit = static_cast<size_t>(id) & 63ull;
+            touch_word(word);
+            return (visit_bitmap_tls[word] >> bit) & 1ull;
+        };
+
+        mark_visited(ep_id);
 
         thread_local std::vector<tableint> neighbors_tls;
         auto &neighbors = neighbors_tls;
@@ -547,12 +581,18 @@ public:
             candidate_set.pop();
 
             tableint curID = currPair.second;
-            collectNeighbors(curID, layer, neighbors);
+            // 预取邻居数据
+            linklistsizeint* ll = get_linklist_at_level(curID, layer);
+            int size = getListCount(ll);
+            const tableint* data = getNeighborsArray(ll);
+            for (int i = 0; i < size; ++i) {
+                _mm_prefetch(getDataByInternalId(data[i]), _MM_HINT_T0);
+            }
 
-            for(tableint candidateID : neighbors){
-
-                if(mark[candidateID] == token) continue;
-                mark[candidateID] = token;
+            for(int i = 0; i < size; ++i){
+                tableint candidateID = data[i];
+                if (is_visited(candidateID)) continue;
+                mark_visited(candidateID);
 
                 dist_t d = L2Distance(query, getDataByInternalId(candidateID));
 
@@ -622,7 +662,6 @@ public:
 
     // 将新节点和已有节点互相连接
     tableint mutuallyConnectNewElement(
-        const void * vec,
         tableint cur_c,
         priority_queue<distPair, vector<distPair>, CompareDist>& top_candidates,
         int level
@@ -704,8 +743,8 @@ public:
 
     // 把数据插入到多层图中
     // 并发插入：通过原子 ID 分配 + per-node 邻接锁，确保多个线程可以安全地同时写入图结构。
-    void insert(const void * vec, int level) {
-        size_t cur_c = cur_element_count.fetch_add(1, std::memory_order_acq_rel);
+    void insert(const float *vec, int level) {
+        tableint cur_c = cur_element_count.fetch_add(1, std::memory_order_acq_rel);
         if (cur_c >= max_elements_)
             throw std::runtime_error("HNSW capacity exceeded");
 
@@ -738,26 +777,10 @@ public:
             linkLists_[cur_c] = (char*)malloc(bytes);
             if (!linkLists_[cur_c]) throw std::runtime_error("malloc high level list failed");
             memset(linkLists_[cur_c], 0, bytes);
-            // for (int lvl = 1; lvl <= curlevel; ++lvl) {
-            //     linklistsizeint* lvl_head = get_linklist_at_level(cur_c, lvl);
-            //     setListCount(lvl_head, 0);
-            // }
         }
-        // 初始化节点相关数据结构
-        // memset(get_linklist0(static_cast<tableint>(cur_c)), 0, size_links_level0_);
-        // memcpy(getDataByInternalId(cur_c), vec, data_size_);
-        
-        // memcpy(getExternalLabelPtr(cur_c), &label, sizeof(labeltype));
-
-        // if(curlevel) {
-        //     linkLists_[cur_c] = (char *) malloc(size_links_per_element_ * curlevel);
-        //     if (linkLists_[cur_c] == nullptr)
-        //        throw std::runtime_error("Not enough memory: addPoint failed to allocate linklist");
-        //     memset(linkLists_[cur_c], 0, size_links_per_element_ * curlevel);
-        // }
 
         if (is_first) {
-            enterpoint_node_.store(static_cast<tableint>(cur_c), std::memory_order_release);
+            enterpoint_node_.store(cur_c, std::memory_order_release);
             maxlevel_.store(curlevel, std::memory_order_release);
             has_enterpoint_.store(true, std::memory_order_release);
             return;
@@ -798,13 +821,13 @@ public:
                 for (int lvl = std::min(curlevel, maxLevelSnapshot); lvl >= 0; lvl--) {
                     auto top_candidates = searchLayer(currObj, vec, lvl, ef_construction_);
                     // 这里把 Algorithm 1 后面的部分 合并到连接邻居一起实现了
-                    currObj = mutuallyConnectNewElement(vec, static_cast<tableint>(cur_c), top_candidates, lvl);
+                    currObj = mutuallyConnectNewElement(cur_c, top_candidates, lvl);
                 }
             } else {
                 tableint ep = enterpoint_copy;
                 for (int lvl = maxLevelSnapshot; lvl >= 0; --lvl) {
                     auto top_candidates = searchLayer(ep, vec, lvl, ef_construction_);
-                    ep = mutuallyConnectNewElement(vec, static_cast<tableint>(cur_c), top_candidates, lvl);
+                    ep = mutuallyConnectNewElement(cur_c, top_candidates, lvl);
                 }
                 bool updated = false;
                 int expected = maxLevelSnapshot;
@@ -815,7 +838,7 @@ public:
                     }
                 }
                 if (updated) {
-                    enterpoint_node_.store(static_cast<tableint>(cur_c), std::memory_order_release);
+                    enterpoint_node_.store(cur_c, std::memory_order_release);
                 }
             }
         }
@@ -823,7 +846,7 @@ public:
 
 
     priority_queue<distPair, vector<distPair>, CompareDist>
-    searchKnn(const void *query_data, size_t k ) const {
+    searchKnn(const float *query, size_t k ) const {
         priority_queue<distPair, vector<distPair>, CompareDist> result;
 
         if (cur_element_count.load(std::memory_order_acquire) == 0 ||
@@ -832,7 +855,7 @@ public:
 
         tableint enterpoint_snapshot = enterpoint_node_.load(std::memory_order_acquire);
         tableint currObj = enterpoint_snapshot;
-        dist_t curdist = L2Distance(query_data, getDataByInternalId(enterpoint_snapshot));
+        dist_t curdist = L2Distance(query, getDataByInternalId(enterpoint_snapshot));
 
         std::vector<tableint> neighbors;
         neighbors.reserve(maxM0_);
@@ -846,7 +869,7 @@ public:
                 for (tableint cand : neighbors) {
                     if (cand >= cur_element_count.load(std::memory_order_acquire))
                         throw std::runtime_error("cand out of range");
-                    dist_t d = L2Distance(query_data, getDataByInternalId(cand));
+                    dist_t d = L2Distance(query, getDataByInternalId(cand));
 
                     if (d < curdist) {
                         curdist = d;
@@ -859,7 +882,7 @@ public:
 
     priority_queue<distPair, vector<distPair>, CompareDist> top_candidates;
     // 查询阶段使用 ef_
-    top_candidates = searchLayer(currObj, query_data, 0, ef_);
+    top_candidates = searchLayer(currObj, query, 0, ef_);
 
         while (top_candidates.size() > k) {
             top_candidates.pop();
@@ -1144,7 +1167,7 @@ public:
 
         cluster_members_ = std::move(current_clusters);
 
-        center_distances_.assign(K_, vector<float>(K_, 0.0f));
+        center_distances_.assign(K_, vector<float>(K_, 0.0));
         parallelFor(K_, [&](size_t begin, size_t end, size_t) {
             for (size_t i = begin; i < end; ++i) {
                 for (size_t j = i + 1; j < K_; ++j) {

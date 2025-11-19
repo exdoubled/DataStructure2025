@@ -18,7 +18,7 @@ void Solution::build(int d, const vector<float>& base) {
     // 单线程插入
     if (worker_count_ == 1) {
         for (size_t i = 0; i < n; ++i) {
-            const void* vec = static_cast<const void*>(&base[i * dim_]);
+            const float* vec = &base[i * dim_];
             insert(vec, -1);
         }
         return;
@@ -30,7 +30,7 @@ void Solution::build(int d, const vector<float>& base) {
         while (true) {
             size_t idx = next_index.fetch_add(1, std::memory_order_relaxed);
             if (idx >= n) break;
-            const void* vec = static_cast<const void*>(&base[idx * dim_]);
+            const float* vec = &base[idx * dim_];
             insert(vec, -1);
         }
     };
@@ -48,7 +48,7 @@ void Solution::build(int d, const vector<float>& base) {
 void Solution::search(const vector<float>& query, int *res) {
     const size_t k = 10;
 
-    auto pq = searchKnn(static_cast<const void*>(query.data()), k);
+    auto pq = searchKnn(query.data(), k);
 
     vector<distPair> buf;
     buf.reserve(pq.size());
