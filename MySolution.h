@@ -41,7 +41,7 @@
 #endif
 
 using namespace std;
-/*
+
 
 // HNSW
 typedef unsigned int tableint;   // unsigned 和 float 都是 4 字节 
@@ -897,8 +897,8 @@ public:
 
 
 };
-*/
 
+/*
 // kmeans
 
 typedef vector<float> V;
@@ -1265,7 +1265,7 @@ public:
     void search(const vector<float>& query, int *res);
 
 };
-
+*/
 
 
 

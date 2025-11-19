@@ -1,7 +1,7 @@
 #include "MySolution.h"
 #include <thread>
 #include <atomic>
-/*
+
 // hnsw
 
 void Solution::build(int d, const vector<float>& base) {
@@ -79,8 +79,8 @@ void Solution::search(const vector<float>& query, int *res) {
     // for (; i < buf.size() && i < k; ++i) res[i] = (int)buf[i].second;
     // for (; i < k; ++i) res[i] = -1;
 }
-*/
 
+/*
 // kmeans
 
 void Solution::build(int d, const vector<float>& base) {
@@ -129,3 +129,4 @@ void Solution::search(const vector<float>& query, int *res) {
             }
         }
 }
+*/
