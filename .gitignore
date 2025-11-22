@@ -14,6 +14,8 @@ ans*.txt
 
 // 可执行文件
 *.exe
+checker
+main
 
 // 配置文件
 Config.h
