@@ -725,7 +725,11 @@ int main(int argc, char** argv) {
     auto eval_start_tp = std::chrono::high_resolution_clock::now();
     for (size_t i = 0; i < num_to_eval; ++i) {
         const auto &gt_row = gt.indices[i];
-        std::unordered_set<int> gt_set(gt_row.begin(), gt_row.end());
+        // Only use the top-k_gt ground truth items for recall calculation
+        // If the ground truth file contains more items (e.g. 100) but header says top-10,
+        // we should only consider the first 10 for strict Recall@10.
+        size_t limit = std::min(gt_row.size(), k_gt);
+        std::unordered_set<int> gt_set(gt_row.begin(), gt_row.begin() + limit);
 
         // top-1
         if (!gt_row.empty() && !pred[i].empty()) {

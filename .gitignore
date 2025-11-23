@@ -23,6 +23,7 @@ Config.h
 // 参考文件
 cpp/
 hnswlib/
+sift/
 
 // 数据-论文文件
 PJ论文/

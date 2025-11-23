@@ -14,7 +14,7 @@ void Solution::build(int d, const vector<float>& base) {
 
     // ==================== HNSW 初始化 ====================
     // 分别代表：max_elements, M, random_seed, ef_construction, ef, data_size, worker_count
-    initHNSW(n, 16, 114514, 200, 300, data_size_, worker_count);
+    initHNSW(n, 16, 114514, 900, 150, data_size_, worker_count);
 
     // 单线程插入
     if (worker_count_ == 1) {
@@ -46,12 +46,8 @@ void Solution::build(int d, const vector<float>& base) {
     }
 
     // ==================== ONNG 优化 ====================
-    // 方法1：直接优化（推荐，无格式转换开销）
-    optimizeGraphDirectly(false);  // 暂时禁用高层优化，先确保第0层工作正常
+    optimizeGraphDirectly(true);
     
-    // 方法2：旧版本（需要格式转换）
-    // applyOnngOptimizationAllLayers(true);
-    // applyOnngPathAdjustment(30);
     
 }
 
