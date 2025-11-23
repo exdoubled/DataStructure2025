@@ -481,7 +481,7 @@ inline dist_t compute(const float* a, const float* b, size_t dim) {
 
 
 namespace onng{
-    // 简化结构：仅用于临时标记和排序
+    // 用于临时标记和排序
     struct EdgeInfo{
         tableint id;
         dist_t dist;
@@ -568,8 +568,6 @@ public:
             
             setListCount(ll, static_cast<unsigned short>(current_size));
         }
-        
-        std::cerr << "Added reverse edges to layer " << layer << std::endl;
     }
     
     // Algorithm 4
@@ -653,31 +651,22 @@ public:
             
             setListCount(ll, static_cast<unsigned short>(new_size));
         }
-        
-        std::cerr << "Pruned redundant paths on layer " << layer << std::endl;
     }
     
     // 统一优化接口
     void optimizeGraphDirectly(bool optimize_high_layers = false) {
         int max_level = maxlevel_.load(std::memory_order_acquire);
         
-        std::cerr << "=== Direct ONNG optimization (no conversion) ===" << std::endl;
-        std::cerr << "Optimizing layer 0..." << std::endl;
-        
         // 第0层：添加反向边 + 剪枝
         addReverseEdgesDirectly(0, 70);
         pruneRedundantPathsDirectly(0, 30);
         
         if (optimize_high_layers && max_level > 0) {
-            std::cerr << "Optimizing higher layers..." << std::endl;
             for (int level = 1; level <= max_level; ++level) {
                 addReverseEdgesDirectly(level, static_cast<size_t>(M_));
                 pruneRedundantPathsDirectly(level, static_cast<size_t>(M_));
-                std::cerr << "  Layer " << level << " done." << std::endl;
             }
         }
-        
-        std::cerr << "=== Direct optimization completed ===" << std::endl;
     }
     
     
