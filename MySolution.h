@@ -17,6 +17,9 @@
 #include <mutex>
 #include <thread>
 #include <memory>
+#include <list>
+#include <unordered_map>
+#include <unordered_set>
 
 // SIMD 指令集相关
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386) || defined(_M_IX86)
@@ -74,22 +77,26 @@ typedef float dist_t;      // 距离类型
 #endif
 
 namespace simd_detail {
+// 优化的标量版本：4路展开提升 ILP (指令级并行)
 inline dist_t l2_distance_scalar(const float* a, const float* b, size_t dim) {
-    dist_t acc0 = 0.0f;
-    dist_t acc1 = 0.0f;
+    dist_t acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     size_t i = 0;
-    size_t bound = dim & ~static_cast<size_t>(1);
-    for (; i < bound; i += 2) {
+    size_t bound = dim & ~static_cast<size_t>(3);
+    for (; i < bound; i += 4) {
         dist_t d0 = a[i]   - b[i];
         dist_t d1 = a[i+1] - b[i+1];
+        dist_t d2 = a[i+2] - b[i+2];
+        dist_t d3 = a[i+3] - b[i+3];
         acc0 += d0 * d0;
         acc1 += d1 * d1;
+        acc2 += d2 * d2;
+        acc3 += d3 * d3;
     }
     for (; i < dim; ++i) {
         dist_t d = a[i] - b[i];
         acc0 += d * d;
     }
-    return acc0 + acc1;
+    return (acc0 + acc1) + (acc2 + acc3);
 }
 
 #if SOLUTION_PLATFORM_X86
@@ -149,16 +156,53 @@ inline void cpuid_subfunction(int info[4], int func_id, int sub_func) {
 #if SOLUTION_COMPILE_AVX512
 SOLUTION_SIMD_TARGET_ATTR("avx512f")
 inline dist_t l2_distance_avx512(const float* a, const float* b, size_t dim) {
-    __m512 acc = _mm512_setzero_ps();
+    // 4路展开累加器，减少依赖链，提升 ILP
+    __m512 acc0 = _mm512_setzero_ps();
+    __m512 acc1 = _mm512_setzero_ps();
+    __m512 acc2 = _mm512_setzero_ps();
+    __m512 acc3 = _mm512_setzero_ps();
     size_t i = 0;
-    size_t bound = dim & (~size_t(15));
-    for (; i < bound; i += 16) {
+    size_t bound = dim & (~size_t(63));  // 64 元素对齐
+    
+    for (; i < bound; i += 64) {
+        // 利用 FMA 指令：diff^2 可以用 FMA 优化
+        __m512 va0 = _mm512_loadu_ps(a + i);
+        __m512 vb0 = _mm512_loadu_ps(b + i);
+        __m512 diff0 = _mm512_sub_ps(va0, vb0);
+        acc0 = _mm512_fmadd_ps(diff0, diff0, acc0);  // acc0 += diff0 * diff0
+        
+        __m512 va1 = _mm512_loadu_ps(a + i + 16);
+        __m512 vb1 = _mm512_loadu_ps(b + i + 16);
+        __m512 diff1 = _mm512_sub_ps(va1, vb1);
+        acc1 = _mm512_fmadd_ps(diff1, diff1, acc1);
+        
+        __m512 va2 = _mm512_loadu_ps(a + i + 32);
+        __m512 vb2 = _mm512_loadu_ps(b + i + 32);
+        __m512 diff2 = _mm512_sub_ps(va2, vb2);
+        acc2 = _mm512_fmadd_ps(diff2, diff2, acc2);
+        
+        __m512 va3 = _mm512_loadu_ps(a + i + 48);
+        __m512 vb3 = _mm512_loadu_ps(b + i + 48);
+        __m512 diff3 = _mm512_sub_ps(va3, vb3);
+        acc3 = _mm512_fmadd_ps(diff3, diff3, acc3);
+    }
+    
+    // 处理剩余完整的 16 元素块
+    size_t bound16 = dim & (~size_t(15));
+    for (; i < bound16; i += 16) {
         __m512 va = _mm512_loadu_ps(a + i);
         __m512 vb = _mm512_loadu_ps(b + i);
         __m512 diff = _mm512_sub_ps(va, vb);
-        acc = _mm512_add_ps(acc, _mm512_mul_ps(diff, diff));
+        acc0 = _mm512_fmadd_ps(diff, diff, acc0);
     }
-    dist_t sum = _mm512_reduce_add_ps(acc);
+    
+    // 合并累加器
+    acc0 = _mm512_add_ps(acc0, acc1);
+    acc2 = _mm512_add_ps(acc2, acc3);
+    acc0 = _mm512_add_ps(acc0, acc2);
+    dist_t sum = _mm512_reduce_add_ps(acc0);
+    
+    // 标量处理剩余元素
     for (; i < dim; ++i) {
         dist_t diff = a[i] - b[i];
         sum += diff * diff;
@@ -168,23 +212,61 @@ inline dist_t l2_distance_avx512(const float* a, const float* b, size_t dim) {
 #endif
 
 #if SOLUTION_COMPILE_AVX
-SOLUTION_SIMD_TARGET_ATTR("avx")
+SOLUTION_SIMD_TARGET_ATTR("avx,avx2,fma")  // 启用 FMA 支持
 inline dist_t l2_distance_avx(const float* a, const float* b, size_t dim) {
-    __m256 acc = _mm256_setzero_ps();
+    // 4路展开，避免依赖链
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps();
+    __m256 acc3 = _mm256_setzero_ps();
     size_t i = 0;
-    size_t bound = dim & (~size_t(7));
-    for (; i < bound; i += 8) {
+    size_t bound = dim & (~size_t(31));  // 32 元素对齐
+    
+    for (; i < bound; i += 32) {
+        __m256 va0 = _mm256_loadu_ps(a + i);
+        __m256 vb0 = _mm256_loadu_ps(b + i);
+        __m256 diff0 = _mm256_sub_ps(va0, vb0);
+        acc0 = _mm256_fmadd_ps(diff0, diff0, acc0);  // FMA: acc0 += diff0^2
+        
+        __m256 va1 = _mm256_loadu_ps(a + i + 8);
+        __m256 vb1 = _mm256_loadu_ps(b + i + 8);
+        __m256 diff1 = _mm256_sub_ps(va1, vb1);
+        acc1 = _mm256_fmadd_ps(diff1, diff1, acc1);
+        
+        __m256 va2 = _mm256_loadu_ps(a + i + 16);
+        __m256 vb2 = _mm256_loadu_ps(b + i + 16);
+        __m256 diff2 = _mm256_sub_ps(va2, vb2);
+        acc2 = _mm256_fmadd_ps(diff2, diff2, acc2);
+        
+        __m256 va3 = _mm256_loadu_ps(a + i + 24);
+        __m256 vb3 = _mm256_loadu_ps(b + i + 24);
+        __m256 diff3 = _mm256_sub_ps(va3, vb3);
+        acc3 = _mm256_fmadd_ps(diff3, diff3, acc3);
+    }
+    
+    // 处理剩余的 8 元素块
+    size_t bound8 = dim & (~size_t(7));
+    for (; i < bound8; i += 8) {
         __m256 va = _mm256_loadu_ps(a + i);
         __m256 vb = _mm256_loadu_ps(b + i);
         __m256 diff = _mm256_sub_ps(va, vb);
-        acc = _mm256_add_ps(acc, _mm256_mul_ps(diff, diff));
+        acc0 = _mm256_fmadd_ps(diff, diff, acc0);
     }
-    __m256 tmp = _mm256_hadd_ps(acc, acc);
-    tmp = _mm256_hadd_ps(tmp, tmp);
-    __m128 low  = _mm256_castps256_ps128(tmp);
-    __m128 high = _mm256_extractf128_ps(tmp, 1);
-    __m128 sum128 = _mm_add_ps(low, high);
-    dist_t sum = _mm_cvtss_f32(sum128);
+    
+    // 合并累加器
+    acc0 = _mm256_add_ps(acc0, acc1);
+    acc2 = _mm256_add_ps(acc2, acc3);
+    acc0 = _mm256_add_ps(acc0, acc2);
+    
+    // 高效的向量规约（避免 hadd）
+    __m128 low = _mm256_castps256_ps128(acc0);
+    __m128 high = _mm256_extractf128_ps(acc0, 1);
+    __m128 sum4 = _mm_add_ps(low, high);
+    sum4 = _mm_add_ps(sum4, _mm_movehl_ps(sum4, sum4));  // 避免 hadd
+    sum4 = _mm_add_ss(sum4, _mm_movehdup_ps(sum4));
+    dist_t sum = _mm_cvtss_f32(sum4);
+    
+    // 标量处理剩余
     for (; i < dim; ++i) {
         dist_t diff = a[i] - b[i];
         sum += diff * diff;
@@ -196,18 +278,56 @@ inline dist_t l2_distance_avx(const float* a, const float* b, size_t dim) {
 #if SOLUTION_COMPILE_SSE3
 SOLUTION_SIMD_TARGET_ATTR("sse3")
 inline dist_t l2_distance_sse3(const float* a, const float* b, size_t dim) {
-    __m128 acc = _mm_setzero_ps();
+    // 4路展开
+    __m128 acc0 = _mm_setzero_ps();
+    __m128 acc1 = _mm_setzero_ps();
+    __m128 acc2 = _mm_setzero_ps();
+    __m128 acc3 = _mm_setzero_ps();
     size_t i = 0;
-    size_t bound = dim & (~size_t(3));
-    for (; i < bound; i += 4) {
+    size_t bound = dim & (~size_t(15));  // 16 元素对齐
+    
+    for (; i < bound; i += 16) {
+        __m128 va0 = _mm_loadu_ps(a + i);
+        __m128 vb0 = _mm_loadu_ps(b + i);
+        __m128 diff0 = _mm_sub_ps(va0, vb0);
+        acc0 = _mm_add_ps(acc0, _mm_mul_ps(diff0, diff0));
+        
+        __m128 va1 = _mm_loadu_ps(a + i + 4);
+        __m128 vb1 = _mm_loadu_ps(b + i + 4);
+        __m128 diff1 = _mm_sub_ps(va1, vb1);
+        acc1 = _mm_add_ps(acc1, _mm_mul_ps(diff1, diff1));
+        
+        __m128 va2 = _mm_loadu_ps(a + i + 8);
+        __m128 vb2 = _mm_loadu_ps(b + i + 8);
+        __m128 diff2 = _mm_sub_ps(va2, vb2);
+        acc2 = _mm_add_ps(acc2, _mm_mul_ps(diff2, diff2));
+        
+        __m128 va3 = _mm_loadu_ps(a + i + 12);
+        __m128 vb3 = _mm_loadu_ps(b + i + 12);
+        __m128 diff3 = _mm_sub_ps(va3, vb3);
+        acc3 = _mm_add_ps(acc3, _mm_mul_ps(diff3, diff3));
+    }
+    
+    // 处理剩余的 4 元素块
+    size_t bound4 = dim & (~size_t(3));
+    for (; i < bound4; i += 4) {
         __m128 va = _mm_loadu_ps(a + i);
         __m128 vb = _mm_loadu_ps(b + i);
         __m128 diff = _mm_sub_ps(va, vb);
-        acc = _mm_add_ps(acc, _mm_mul_ps(diff, diff));
+        acc0 = _mm_add_ps(acc0, _mm_mul_ps(diff, diff));
     }
-    acc = _mm_hadd_ps(acc, acc);
-    acc = _mm_hadd_ps(acc, acc);
-    dist_t sum = _mm_cvtss_f32(acc);
+    
+    // 合并累加器
+    acc0 = _mm_add_ps(acc0, acc1);
+    acc2 = _mm_add_ps(acc2, acc3);
+    acc0 = _mm_add_ps(acc0, acc2);
+    
+    // 高效规约（避免 hadd）
+    acc0 = _mm_add_ps(acc0, _mm_movehl_ps(acc0, acc0));
+    acc0 = _mm_add_ss(acc0, _mm_movehdup_ps(acc0));
+    dist_t sum = _mm_cvtss_f32(acc0);
+    
+    // 标量处理剩余
     for (; i < dim; ++i) {
         dist_t diff = a[i] - b[i];
         sum += diff * diff;
@@ -219,18 +339,58 @@ inline dist_t l2_distance_sse3(const float* a, const float* b, size_t dim) {
 #if SOLUTION_COMPILE_SSE
 SOLUTION_SIMD_TARGET_ATTR("sse2")
 inline dist_t l2_distance_sse(const float* a, const float* b, size_t dim) {
-    __m128 acc = _mm_setzero_ps();
+    // 4路展开
+    __m128 acc0 = _mm_setzero_ps();
+    __m128 acc1 = _mm_setzero_ps();
+    __m128 acc2 = _mm_setzero_ps();
+    __m128 acc3 = _mm_setzero_ps();
     size_t i = 0;
-    size_t bound = dim & (~size_t(3));
-    for (; i < bound; i += 4) {
+    size_t bound = dim & (~size_t(15));
+    
+    for (; i < bound; i += 16) {
+        __m128 va0 = _mm_loadu_ps(a + i);
+        __m128 vb0 = _mm_loadu_ps(b + i);
+        __m128 diff0 = _mm_sub_ps(va0, vb0);
+        acc0 = _mm_add_ps(acc0, _mm_mul_ps(diff0, diff0));
+        
+        __m128 va1 = _mm_loadu_ps(a + i + 4);
+        __m128 vb1 = _mm_loadu_ps(b + i + 4);
+        __m128 diff1 = _mm_sub_ps(va1, vb1);
+        acc1 = _mm_add_ps(acc1, _mm_mul_ps(diff1, diff1));
+        
+        __m128 va2 = _mm_loadu_ps(a + i + 8);
+        __m128 vb2 = _mm_loadu_ps(b + i + 8);
+        __m128 diff2 = _mm_sub_ps(va2, vb2);
+        acc2 = _mm_add_ps(acc2, _mm_mul_ps(diff2, diff2));
+        
+        __m128 va3 = _mm_loadu_ps(a + i + 12);
+        __m128 vb3 = _mm_loadu_ps(b + i + 12);
+        __m128 diff3 = _mm_sub_ps(va3, vb3);
+        acc3 = _mm_add_ps(acc3, _mm_mul_ps(diff3, diff3));
+    }
+    
+    // 处理剩余的 4 元素块
+    size_t bound4 = dim & (~size_t(3));
+    for (; i < bound4; i += 4) {
         __m128 va = _mm_loadu_ps(a + i);
         __m128 vb = _mm_loadu_ps(b + i);
         __m128 diff = _mm_sub_ps(va, vb);
-        acc = _mm_add_ps(acc, _mm_mul_ps(diff, diff));
+        acc0 = _mm_add_ps(acc0, _mm_mul_ps(diff, diff));
     }
-    alignas(16) float buffer[4];
-    _mm_store_ps(buffer, acc);
-    dist_t sum = buffer[0] + buffer[1] + buffer[2] + buffer[3];
+    
+    // 合并累加器
+    acc0 = _mm_add_ps(acc0, acc1);
+    acc2 = _mm_add_ps(acc2, acc3);
+    acc0 = _mm_add_ps(acc0, acc2);
+    
+    // 高效规约（SSE2，无 shuffle）
+    __m128 shuf = _mm_shuffle_ps(acc0, acc0, _MM_SHUFFLE(2, 3, 0, 1));
+    acc0 = _mm_add_ps(acc0, shuf);
+    shuf = _mm_movehl_ps(shuf, acc0);
+    acc0 = _mm_add_ss(acc0, shuf);
+    dist_t sum = _mm_cvtss_f32(acc0);
+    
+    // 标量处理剩余
     for (; i < dim; ++i) {
         dist_t diff = a[i] - b[i];
         sum += diff * diff;
@@ -320,13 +480,675 @@ inline dist_t compute(const float* a, const float* b, size_t dim) {
 } // namespace simd_detail
 
 
+namespace onng{
+    // 简化结构：仅用于临时标记和排序
+    struct EdgeInfo{
+        tableint id;
+        dist_t dist;
+        
+        EdgeInfo(tableint _id, dist_t _dist) : id(_id), dist(_dist) {}
+    };
+
+    // 旧的 OnngGraph 定义保留以兼容旧代码（如果有的话）
+    struct OnngNeighborEdge{
+        tableint id;
+        dist_t dist;
+        bool remove;
+    };
+    using OnngGraph = vector<vector<OnngNeighborEdge>>;
+
+    // Algorithm 3
+    // 使用约束重建图,包含原始边和反向边
+    // originalEdgeSize: 每个节点保留的原始边数量上限
+    // reverseEdgeSize: 每个节点接受的反向边数量上限(入度限制)
+    // mode: 'a' = 严格控制出度, 'c' = 宽松模式
+    inline void reconstructGraphWithConstraint(
+        const OnngGraph &inputGraph,
+        OnngGraph &outGraph,
+        size_t originalEdgeSize,
+        size_t reverseEdgeSize,
+        char mode = 'a'
+    ) {
+        // Step 1: 清空输出图
+        outGraph.clear();
+        outGraph.resize(inputGraph.size());
+
+        // Step 2: 构建反向边索引
+        // reverse[i] 存储所有指向节点 i 的边
+        vector<vector<OnngNeighborEdge>> reverse(inputGraph.size());
+        
+        for (tableint id = 0; id < static_cast<tableint>(inputGraph.size()); ++id) {
+            const auto &edges = inputGraph[id];
+            for (const auto &edge : edges) {
+                if (edge.id < inputGraph.size()) {
+                    // 记录从 id 到 edge.id 的边的反向信息
+                    reverse[edge.id].push_back({id, edge.dist, false});
+                }
+            }
+        }
+
+        // Step 3: 按反向边数量排序节点
+        // 优先处理反向边少的节点,确保连通性
+        vector<pair<size_t, tableint>> reverseSize;
+        reverseSize.reserve(inputGraph.size());
+        
+        for (tableint id = 0; id < static_cast<tableint>(inputGraph.size()); ++id) {
+            reverseSize.push_back({reverse[id].size(), id});
+        }
+        std::sort(reverseSize.begin(), reverseSize.end());
+
+        // Step 4: 添加反向边
+        // indegreeCount[i] 记录节点 i 当前的入度
+        vector<size_t> indegreeCount(inputGraph.size(), 0);
+        size_t zeroCount = 0;
+
+        for (const auto &[revSize, rid] : reverseSize) {
+            if (revSize == 0) {
+                zeroCount++;
+                continue;
+            }
+
+            auto &rnode = reverse[rid];
+            
+            // 遍历所有指向 rid 的节点
+            for (const auto &redge : rnode) {
+                tableint srcID = redge.id;
+                
+                // 检查源节点的入度是否已达上限
+                if (indegreeCount[srcID] >= reverseEdgeSize) {
+                    continue;
+                }
+                
+                // 如果源节点已有入边且输出图中该节点边数已达上限,跳过
+                if (indegreeCount[srcID] > 0 && outGraph[rid].size() >= originalEdgeSize) {
+                    continue;
+                }
+
+                // 添加反向边: rid -> srcID
+                outGraph[rid].push_back({srcID, redge.dist, false});
+                indegreeCount[srcID]++;
+            }
+        }
+
+        std::cerr << "Zero outdegree nodes by reverse edges: " << zeroCount << std::endl;
+
+        // Step 5: 去重和排序
+        for (auto &edges : outGraph) {
+            if (edges.empty()) continue;
+            
+            // 按 ID 和距离排序
+            std::sort(edges.begin(), edges.end(), [](const OnngNeighborEdge &a, const OnngNeighborEdge &b) {
+                if (a.id != b.id) return a.id < b.id;
+                return a.dist < b.dist;
+            });
+            
+            // 去除重复边(保留距离最短的)
+            auto it = std::unique(edges.begin(), edges.end(), 
+                [](const OnngNeighborEdge &a, const OnngNeighborEdge &b) {
+                    return a.id == b.id;
+                });
+            edges.erase(it, edges.end());
+        }
+
+        // Step 6: 添加原始边
+        for (tableint id = 0; id < static_cast<tableint>(inputGraph.size()); ++id) {
+            const auto &srcEdges = inputGraph[id];
+            auto &outEdges = outGraph[id];
+            
+            bool stop = false;
+            size_t addedCount = 0;
+            
+            for (const auto &edge : srcEdges) {
+                if (addedCount >= originalEdgeSize) break;
+                if (stop) break;
+                
+                // 根据模式检查是否继续添加
+                switch (mode) {
+                    case 'a':
+                        // 严格模式: 如果已达到原始边数上限则停止
+                        if (outEdges.size() >= originalEdgeSize) {
+                            stop = true;
+                            continue;
+                        }
+                        break;
+                    case 'c':
+                        // 宽松模式: 继续添加
+                        break;
+                }
+                
+                // 检查边是否已存在
+                bool exists = false;
+                for (const auto &existing : outEdges) {
+                    if (existing.id == edge.id) {
+                        exists = true;
+                        break;
+                    }
+                }
+                
+                if (!exists) {
+                    outEdges.push_back(edge);
+                    addedCount++;
+                }
+            }
+        }
+
+        // Step 7: 最终排序
+        for (auto &edges : outGraph) {
+            if (!edges.empty()) {
+                std::sort(edges.begin(), edges.end(), [](const OnngNeighborEdge &a, const OnngNeighborEdge &b) {
+                    if (a.dist != b.dist) return a.dist < b.dist;
+                    return a.id < b.id;
+                });
+            }
+        }
+    }
+
+    inline bool edgeComp(OnngNeighborEdge a, OnngNeighborEdge b) {
+        return (a.id & 0x7FFFFFFF) < (b.id & 0x7FFFFFFF);
+    }
+
+    // Algorithm 5
+    // 检查从 sID 到 dID 是否存在边
+    static bool hasEdge(const OnngGraph &G, tableint sID, tableint dID) {
+        if (sID >= G.size() || G[sID].empty()) return false;
+        
+        for (const auto &edge : G[sID]) {
+            if (edge.id == dID) return true;
+        }
+        return false;
+    }
+
+    
+    inline void adjustPathsEffectively(OnngGraph &G, size_t minNoOfEdges) {
+        // Step 1: 复制原图并准备临时图
+        OnngGraph tmpGraph = G;
+        
+        // 清空原图,准备重建
+        for (auto &edges : G) {
+            edges.clear();
+        }
+
+        // Step 2: 为每个节点找出可能被移除的边候选
+        // removeCandidates[i] 存储节点 i 的边移除候选: (中间节点, 目标节点)
+        vector<vector<pair<tableint, tableint>>> removeCandidates(tmpGraph.size());
+        
+        for (tableint id = 0; id < static_cast<tableint>(tmpGraph.size()); ++id) {
+            auto &srcEdges = tmpGraph[id];
+            if (srcEdges.empty()) continue;
+            
+            // 建立当前节点邻居的快速查找表
+            unordered_map<tableint, pair<size_t, dist_t>> neighbors;
+            for (size_t i = 0; i < srcEdges.size(); ++i) {
+                neighbors[srcEdges[i].id] = {i, srcEdges[i].dist};
+            }
+            
+            // 对于每条边 id->mid
+            vector<pair<size_t, pair<tableint, tableint>>> candidates;
+            for (size_t i = 0; i < srcEdges.size(); ++i) {
+                tableint midID = srcEdges[i].id;
+                dist_t dist_to_mid = srcEdges[i].dist;
+                
+                // 检查通过 mid 能否到达其他邻居
+                auto &pathEdges = tmpGraph[midID];
+                for (auto &pathEdge : pathEdges) {
+                    tableint dstID = pathEdge.id;
+                    dist_t dist_mid_to_dst = pathEdge.dist;
+                    
+                    // 如果 dst 也是 id 的直接邻居
+                    auto it = neighbors.find(dstID);
+                    if (it != neighbors.end()) {
+                        dist_t direct_dist = it->second.second;
+                        // 如果通过 mid 的两条边都比直接边短,则直接边可以被移除
+                        if (dist_to_mid < direct_dist && dist_mid_to_dst < direct_dist) {
+                            candidates.push_back({it->second.first, {midID, dstID}});
+                        }
+                    }
+                }
+            }
+            
+            // 按索引降序排序,这样后面按顺序处理时不会出现问题
+            sort(candidates.begin(), candidates.end(), 
+                 std::greater<pair<size_t, pair<tableint, tableint>>>());
+            
+            removeCandidates[id].reserve(candidates.size());
+            for (auto &cand : candidates) {
+                removeCandidates[id].push_back(cand.second);
+            }
+        }
+
+        // Step 3: 逐轮处理每个节点的边,决定保留还是移除
+        // 维护每个节点当前处理到第几条边
+        vector<size_t> rank(tmpGraph.size(), 0);
+        std::list<tableint> activeNodes;
+        
+        for (tableint i = 0; i < static_cast<tableint>(tmpGraph.size()); ++i) {
+            if (!tmpGraph[i].empty()) {
+                activeNodes.push_back(i);
+            }
+        }
+        
+        int removeCount = 0;
+        
+        while (!activeNodes.empty()) {
+            for (auto it = activeNodes.begin(); it != activeNodes.end(); ) {
+                tableint id = *it;
+                auto &srcEdges = tmpGraph[id];
+                size_t currentRank = rank[id];
+                
+                // 如果该节点的边已经处理完
+                if (currentRank >= srcEdges.size()) {
+                    it = activeNodes.erase(it);
+                    continue;
+                }
+                
+                bool shouldRemove = false;
+                
+                // 检查是否有移除候选且满足最小边数约束
+                if (!removeCandidates[id].empty() && 
+                    (G[id].size() + srcEdges.size() - currentRank) > minNoOfEdges) {
+                    
+                    tableint currentDst = srcEdges[currentRank].id;
+                    
+                    // 检查所有指向当前目标的候选路径
+                    while (!removeCandidates[id].empty() && 
+                           removeCandidates[id].back().second == currentDst) {
+                        tableint pathNode = removeCandidates[id].back().first;
+                        tableint dstNode = removeCandidates[id].back().second;
+                        removeCandidates[id].pop_back();
+                        
+                        // 验证替代路径是否存在于重建的图中
+                        if (hasEdge(G, id, pathNode) && hasEdge(G, pathNode, dstNode)) {
+                            shouldRemove = true;
+                            // 清除所有指向同一目标的其他候选
+                            while (!removeCandidates[id].empty() &&
+                                   removeCandidates[id].back().second == currentDst) {
+                                removeCandidates[id].pop_back();
+                            }
+                            break;
+                        }
+                    }
+                }
+                
+                if (shouldRemove) {
+                    removeCount++;
+                } else {
+                    // 将这条边添加到重建的图中
+                    OnngNeighborEdge edge = srcEdges[currentRank];
+                    G[id].push_back(edge);
+                }
+                
+                rank[id]++;
+                ++it;
+            }
+        }
+        
+        // Step 4: 对每个节点的边按距离排序
+        for (auto &edges : G) {
+            if (!edges.empty()) {
+                sort(edges.begin(), edges.end(), [](const OnngNeighborEdge &a, const OnngNeighborEdge &b) {
+                    if (a.dist != b.dist) return a.dist < b.dist;
+                    return a.id < b.id;
+                });
+            }
+        }
+    }
+
+} // namespace onng
+
 class Solution {
 public:
+    // ==================== ONNG 兼容接口 ====================
+    
+    // 将 HNSW 第 0 层图结构导出为 ONNG 格式
+    onng::OnngGraph exportToOnngGraph() const {
+        size_t node_count = cur_element_count.load(std::memory_order_acquire);
+        onng::OnngGraph graph(node_count);
+        
+        for (tableint id = 0; id < static_cast<tableint>(node_count); ++id) {
+            linklistsizeint* ll = get_linklist0(id);
+            int size = getListCount(ll);
+            const tableint* neighbors = getNeighborsArray(ll);
+            
+            graph[id].reserve(size);
+            const float* src_data = getDataByInternalId(id);
+            
+            for (int i = 0; i < size; ++i) {
+                tableint neighbor_id = neighbors[i];
+                const float* dst_data = getDataByInternalId(neighbor_id);
+                dist_t dist = L2Distance(src_data, dst_data);
+                graph[id].push_back({neighbor_id, dist, false});
+            }
+        }
+        
+        return graph;
+    }
+    
+    // 从 ONNG 格式导入回 HNSW 第 0 层(清空原有连接)
+    void importFromOnngGraph(const onng::OnngGraph& graph) {
+        size_t node_count = cur_element_count.load(std::memory_order_acquire);
+        if (graph.size() != node_count) {
+            throw std::runtime_error("Graph size mismatch");
+        }
+        
+        for (tableint id = 0; id < static_cast<tableint>(node_count); ++id) {
+            std::lock_guard<std::mutex> lock(link_list_locks_[id]);
+            
+            linklistsizeint* ll = get_linklist0(id);
+            tableint* neighbors = getNeighborsArray(ll);
+            
+            const auto& edges = graph[id];
+            size_t copy_count = std::min(edges.size(), static_cast<size_t>(maxM0_));
+            
+            for (size_t i = 0; i < copy_count; ++i) {
+                neighbors[i] = edges[i].id;
+            }
+            setListCount(ll, static_cast<unsigned short>(copy_count));
+        }
+    }
+    
+    // 应用 ONNG 重建算法到 HNSW 图
+    void applyOnngReconstruction(size_t originalEdgeSize, size_t reverseEdgeSize, char mode = 'a') {
+        // 1. 导出为 ONNG 格式
+        onng::OnngGraph inputGraph = exportToOnngGraph();
+        
+        // 2. 应用 ONNG 重建算法
+        onng::OnngGraph outputGraph;
+        onng::reconstructGraphWithConstraint(inputGraph, outputGraph, 
+                                            originalEdgeSize, reverseEdgeSize, mode);
+        
+        // 3. 导入回 HNSW
+        importFromOnngGraph(outputGraph);
+    }
+    
+    // 应用 ONNG 路径调整算法到 HNSW 图（仅第0层）
+    void applyOnngPathAdjustment(size_t minNoOfEdges) {
+        // 1. 导出为 ONNG 格式
+        onng::OnngGraph graph = exportToOnngGraph();
+        
+        // 2. 应用路径调整
+        onng::adjustPathsEffectively(graph, minNoOfEdges);
+        
+        // 3. 导入回 HNSW
+        importFromOnngGraph(graph);
+    }
+    
+    // 导出指定层的图为 ONNG 格式
+    onng::OnngGraph exportLayerToOnngGraph(int layer) const {
+        size_t node_count = cur_element_count.load(std::memory_order_acquire);
+        onng::OnngGraph graph(node_count);
+        
+        for (tableint id = 0; id < static_cast<tableint>(node_count); ++id) {
+            // 跳过不存在于该层的节点
+            if (layer > element_levels_[id]) continue;
+            
+            linklistsizeint* ll = get_linklist_at_level(id, layer);
+            int size = getListCount(ll);
+            const tableint* neighbors = getNeighborsArray(ll);
+            
+            graph[id].reserve(size);
+            const float* src_data = getDataByInternalId(id);
+            
+            for (int i = 0; i < size; ++i) {
+                tableint neighbor_id = neighbors[i];
+                const float* dst_data = getDataByInternalId(neighbor_id);
+                dist_t dist = L2Distance(src_data, dst_data);
+                graph[id].push_back({neighbor_id, dist, false});
+            }
+        }
+        
+        return graph;
+    }
+    
+    // 将 ONNG 格式导入回指定层
+    void importLayerFromOnngGraph(const onng::OnngGraph& graph, int layer) {
+        size_t node_count = cur_element_count.load(std::memory_order_acquire);
+        if (graph.size() != node_count) {
+            throw std::runtime_error("Graph size mismatch");
+        }
+        
+        size_t max_edges = (layer == 0) ? maxM0_ : maxM_;
+        
+        for (tableint id = 0; id < static_cast<tableint>(node_count); ++id) {
+            if (layer > element_levels_[id]) continue;
+            
+            std::lock_guard<std::mutex> lock(link_list_locks_[id]);
+            
+            linklistsizeint* ll = get_linklist_at_level(id, layer);
+            tableint* neighbors = getNeighborsArray(ll);
+            
+            const auto& edges = graph[id];
+            size_t copy_count = std::min(edges.size(), max_edges);
+            
+            for (size_t i = 0; i < copy_count; ++i) {
+                neighbors[i] = edges[i].id;
+            }
+            setListCount(ll, static_cast<unsigned short>(copy_count));
+        }
+    }
+    
+    // ==================== ONNG 优化 =========================
+    // maxReverseEdges 对应 reverseEdgeSize（入度限制）
+    // 使用 onng ，首先在 HNSW 指定层添加反向边优化，对应原论文 Algorithm 3 的添加反向边并限制入度的实现
+    // reconstructGraphWithConstraint
+    void addReverseEdgesDirectly(int layer = 0, size_t maxReverseEdges = 70) {
+        size_t node_count = cur_element_count.load(std::memory_order_acquire);
+        size_t max_edges = (layer == 0) ? maxM0_ : maxM_;
+        
+        // Step 1: 统计每个节点的入度（被多少节点指向）
+        std::vector<std::vector<onng::EdgeInfo>> reverseEdges(node_count);
+        
+        for (tableint src = 0; src < static_cast<tableint>(node_count); ++src) {
+            if (layer > element_levels_[src]) continue;
+            
+            linklistsizeint* ll = get_linklist_at_level(src, layer);
+            int size = getListCount(ll);
+            const tableint* neighbors = getNeighborsArray(ll);
+            const float* src_data = getDataByInternalId(src);
+            
+            for (int i = 0; i < size; ++i) {
+                tableint dst = neighbors[i];
+                if (dst >= node_count) continue;
+                
+                const float* dst_data = getDataByInternalId(dst);
+                dist_t dist = L2Distance(src_data, dst_data);
+                reverseEdges[dst].emplace_back(src, dist);
+            }
+        }
+        
+        // Step 2: 按入度排序，优先处理入度少的节点（提升连通性）
+        std::vector<std::pair<size_t, tableint>> sortedByIndegree;
+        sortedByIndegree.reserve(node_count);
+        for (tableint id = 0; id < static_cast<tableint>(node_count); ++id) {
+            if (layer > element_levels_[id]) continue;
+            sortedByIndegree.emplace_back(reverseEdges[id].size(), id);
+        }
+        std::sort(sortedByIndegree.begin(), sortedByIndegree.end());
+        
+        // Step 3: 添加反向边
+        std::vector<size_t> addedReverseCounts(node_count, 0);
+        
+        for (const auto& [indegree, dst] : sortedByIndegree) {
+            if (reverseEdges[dst].empty()) continue;
+            
+            std::lock_guard<std::mutex> lock(link_list_locks_[dst]);
+            
+            linklistsizeint* ll = get_linklist_at_level(dst, layer);
+            tableint* neighbors = getNeighborsArray(ll);
+            int current_size = getListCount(ll);
+            
+            // 建立现有邻居的快速查找
+            std::unordered_set<tableint> existing;
+            for (int i = 0; i < current_size; ++i) {
+                existing.insert(neighbors[i]);
+            }
+            
+            // 按距离排序反向边候选
+            auto& candidates = reverseEdges[dst];
+            std::sort(candidates.begin(), candidates.end(), 
+                [](const onng::EdgeInfo& a, const onng::EdgeInfo& b) {
+                    return a.dist < b.dist;
+                });
+            
+            // 添加新的反向边
+            for (const auto& edge : candidates) {
+                if (current_size >= static_cast<int>(max_edges)) break;
+                if (addedReverseCounts[edge.id] >= maxReverseEdges) continue;
+                if (existing.count(edge.id)) continue;
+                
+                neighbors[current_size++] = edge.id;
+                existing.insert(edge.id);
+                addedReverseCounts[edge.id]++;
+            }
+            
+            setListCount(ll, static_cast<unsigned short>(current_size));
+        }
+        
+        std::cerr << "Added reverse edges to layer " << layer << std::endl;
+    }
+    
+    // Algorithm 4
+    // 调整路径以移除冗余边
+    void pruneRedundantPathsDirectly(int layer = 0, size_t minNoOfEdges = 30) {
+        size_t node_count = cur_element_count.load(std::memory_order_acquire);
+        
+        for (tableint src = 0; src < static_cast<tableint>(node_count); ++src) {
+            if (layer > element_levels_[src]) continue;
+            
+            std::lock_guard<std::mutex> lock(link_list_locks_[src]);
+            
+            linklistsizeint* ll = get_linklist_at_level(src, layer);
+            int size = getListCount(ll);
+            
+            if (size <= static_cast<int>(minNoOfEdges)) continue;
+            
+            tableint* neighbors = getNeighborsArray(ll);
+            const float* src_data = getDataByInternalId(src);
+            
+            // 构建邻居信息
+            std::vector<onng::EdgeInfo> edges;
+            edges.reserve(size);
+            for (int i = 0; i < size; ++i) {
+                tableint nbr = neighbors[i];
+                const float* nbr_data = getDataByInternalId(nbr);
+                dist_t dist = L2Distance(src_data, nbr_data);
+                edges.emplace_back(nbr, dist);
+            }
+            
+            // 标记可删除的边
+            std::vector<bool> toRemove(edges.size(), false);
+            
+            // 对每条边检查是否有更短的两跳路径
+            for (size_t i = 0; i < edges.size(); ++i) {
+                tableint dst = edges[i].id;
+                dist_t direct_dist = edges[i].dist;
+                
+                // 遍历中间节点
+                for (size_t j = 0; j < edges.size(); ++j) {
+                    if (i == j) continue;
+                    
+                    tableint mid = edges[j].id;
+                    dist_t dist_to_mid = edges[j].dist;
+                    
+                    if (dist_to_mid >= direct_dist) continue;
+                    
+                    // 检查 mid -> dst 是否存在
+                    linklistsizeint* mid_ll = get_linklist_at_level(mid, layer);
+                    int mid_size = getListCount(mid_ll);
+                    const tableint* mid_neighbors = getNeighborsArray(mid_ll);
+                    
+                    bool found = false;
+                    dist_t dist_mid_to_dst = 0.0f;
+                    
+                    for (int k = 0; k < mid_size; ++k) {
+                        if (mid_neighbors[k] == dst) {
+                            const float* mid_data = getDataByInternalId(mid);
+                            const float* dst_data = getDataByInternalId(dst);
+                            dist_mid_to_dst = L2Distance(mid_data, dst_data);
+                            found = true;
+                            break;
+                        }
+                    }
+                    
+                    // 如果两跳都比直接边短，标记删除
+                    if (found && dist_mid_to_dst < direct_dist) {
+                        toRemove[i] = true;
+                        break;
+                    }
+                }
+            }
+            
+            // 重建邻居列表，跳过标记删除的边
+            int new_size = 0;
+            for (size_t i = 0; i < edges.size(); ++i) {
+                if (!toRemove[i] || new_size < static_cast<int>(minNoOfEdges)) {
+                    neighbors[new_size++] = edges[i].id;
+                }
+            }
+            
+            setListCount(ll, static_cast<unsigned short>(new_size));
+        }
+        
+        std::cerr << "Pruned redundant paths on layer " << layer << std::endl;
+    }
+    
+    // 统一优化接口（直接操作，无转换）
+    void optimizeGraphDirectly(bool optimize_high_layers = false) {
+        int max_level = maxlevel_.load(std::memory_order_acquire);
+        
+        std::cerr << "=== Direct ONNG optimization (no conversion) ===" << std::endl;
+        std::cerr << "Optimizing layer 0..." << std::endl;
+        
+        // 第0层：添加反向边 + 剪枝
+        addReverseEdgesDirectly(0, 70);
+        pruneRedundantPathsDirectly(0, 30);
+        
+        if (optimize_high_layers && max_level > 0) {
+            std::cerr << "Optimizing higher layers..." << std::endl;
+            for (int level = 1; level <= max_level; ++level) {
+                addReverseEdgesDirectly(level, static_cast<size_t>(M_));
+                pruneRedundantPathsDirectly(level, static_cast<size_t>(M_ / 2));
+                std::cerr << "  Layer " << level << " done." << std::endl;
+            }
+        }
+        
+        std::cerr << "=== Direct optimization completed ===" << std::endl;
+    }
+    
+    // 对所有层应用 ONNG 优化（轻度）【旧版本，保留兼容性】
+    void applyOnngOptimizationAllLayers(bool optimize_high_layers = false) {
+        int max_level = maxlevel_.load(std::memory_order_acquire);
+        
+        std::cerr << "Optimizing layer 0 (main layer) with full ONNG..." << std::endl;
+        // 第0层：完整优化
+        applyOnngReconstruction(50, 70, 'a');
+        
+        if (optimize_high_layers && max_level > 0) {
+            std::cerr << "Optimizing higher layers (1-" << max_level << ")..." << std::endl;
+            // 高层：仅轻度路径调整
+            for (int level = 1; level <= max_level; ++level) {
+                onng::OnngGraph layer_graph = exportLayerToOnngGraph(level);
+                
+                // 高层使用更保守的参数，避免破坏导航结构
+                size_t min_edges = static_cast<size_t>(M_);
+                // size_t min_edges = (level == 1) ? static_cast<size_t>(M_) : static_cast<size_t>(M_ / 2);
+                onng::adjustPathsEffectively(layer_graph, min_edges);
+                
+                importLayerFromOnngGraph(layer_graph, level);
+                std::cerr << "  Layer " << level << " optimized." << std::endl;
+            }
+        }
+        
+        std::cerr << "Multi-layer ONNG optimization completed." << std::endl;
+    }
+    
+    
+    // ==================== HNSW 结构 ====================
+
     // 图结构
     // 储存节点数据及第 0 层的邻居关系
     // 邻居数量，flag, 凑对齐，邻居节点 id，数据向量，标签
-    // 对每一个 Node: size->flag->reserved->neighbors->data->label
-    // size:2 bytes, flag:1 byte, reserved:1 byte
+    // 对每一个 Node: size->->reserved->neighbors->data
+    // size:2 bytes, reserved:2 byte
 
     char* data_level0_memory_{nullptr};
     
@@ -896,4 +1718,7 @@ public:
 
 
 };
+
+
+
 #endif //CPP_SOLUTION_H
