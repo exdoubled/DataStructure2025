@@ -635,6 +635,8 @@ int main(int argc, char** argv) {
     const int pred_k = 10;
     std::vector<std::vector<int>> pred(num_to_eval, std::vector<int>(pred_k, -1));
     double build_ms = 0.0, search_ms = 0.0, avg_ms = 0.0;
+    double avg_distance_calcs = 0.0;
+    bool has_distance_stats = false;
 
     auto search_start_tp = std::chrono::high_resolution_clock::now();
     if (algo == "solution") {
@@ -661,6 +663,8 @@ int main(int argc, char** argv) {
         auto t1 = std::chrono::high_resolution_clock::now();
         build_ms = std::chrono::duration<double>(t_build_end - t_build_start).count() * 1000.0;
         search_ms = std::chrono::duration<double>(t1 - t0).count() * 1000.0;
+        avg_distance_calcs = sol.getAverageDistanceCalcsPerSearch();
+        has_distance_stats = true;
     } else if (algo == "hnsw") {
         // 使用 hnswlib 进行 ANN 搜索，参考根目录 cpp/example 的调用模式
         hnswlib::L2Space space(dim);
@@ -760,6 +764,9 @@ int main(int argc, char** argv) {
     std::cout << "Build latency: " << build_ms << " ms\n";
     std::cout << "Search latency (total): " << search_ms << " ms\n";
     std::cout << "Average search latency: " << avg_ms << " ms/query\n";
+    if (has_distance_stats) {
+        std::cout << "Average distance computations: " << avg_distance_calcs << " per query\n";
+    }
 
     return 0;
 }

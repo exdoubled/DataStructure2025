@@ -14,7 +14,7 @@ void Solution::build(int d, const vector<float>& base) {
 
     // ==================== HNSW 初始化 ====================
     // 分别代表：max_elements, M, random_seed, ef_construction, ef, data_size, worker_count
-    initHNSW(n, 32, 114514, 900, 150, data_size_, worker_count);
+    initHNSW(n, 32, 114514, 900, 70, data_size_, worker_count);
 
     // 单线程插入
     if (worker_count_ == 1) {
@@ -52,7 +52,7 @@ void Solution::build(int d, const vector<float>& base) {
 }
 
 void Solution::search(const vector<float>& query, int *res) {
-    // SearchDistanceScope distance_scope(*this);
+    SearchDistanceScope distance_scope(*this);
     const size_t k = 10;
 
     auto pq = searchKnn(query.data(), k);

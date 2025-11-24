@@ -13,6 +13,7 @@
 #include <cstring>
 #include <utility>
 #include <cstddef>
+#include <cstdint>
 #include <atomic>
 #include <mutex>
 #include <thread>
@@ -42,6 +43,13 @@
 #endif
 
 using namespace std;
+
+class Solution;
+
+struct DistanceStatContext {
+    inline static thread_local const Solution* active_solution = nullptr;
+    inline static thread_local uint64_t counter = 0;
+};
 
 
 // HNSW
@@ -840,6 +848,11 @@ public:
 
     // 欧式距离
     dist_t L2Distance(const float * a, const float * b) const {
+        /*
+        if (DistanceStatContext::active_solution == this) {
+            DistanceStatContext::counter++;
+        }
+        */
         return simd_detail::compute(a, b, dim_);
     }
 
@@ -1243,6 +1256,47 @@ public:
     void build(int d, const vector<float>& base);
 
     void search(const vector<float>& query, int *res);
+
+    double getAverageDistanceCalcsPerSearch() const {
+        uint64_t searches = query_count_.load(std::memory_order_relaxed);
+        if (searches == 0) {
+            return 0.0;
+        }
+        uint64_t total = query_distance_calcs_.load(std::memory_order_relaxed);
+        return static_cast<double>(total) / static_cast<double>(searches);
+    }
+
+private:
+    class SearchDistanceScope {
+    public:
+        explicit SearchDistanceScope(Solution& sol)
+            : sol_(sol),
+              prev_solution_(DistanceStatContext::active_solution),
+              prev_counter_(DistanceStatContext::counter) {
+            DistanceStatContext::active_solution = &sol_;
+            DistanceStatContext::counter = 0;
+        }
+
+        ~SearchDistanceScope() {
+            const uint64_t count = DistanceStatContext::counter;
+            DistanceStatContext::active_solution = prev_solution_;
+            DistanceStatContext::counter = prev_counter_;
+            sol_.record_search_distance(count);
+        }
+
+    private:
+        Solution& sol_;
+        const Solution* prev_solution_;
+        uint64_t prev_counter_;
+    };
+
+    void record_search_distance(uint64_t count) const {
+        query_distance_calcs_.fetch_add(count, std::memory_order_relaxed);
+        query_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    mutable std::atomic<uint64_t> query_distance_calcs_{0};
+    mutable std::atomic<uint64_t> query_count_{0};
 
 
 };
