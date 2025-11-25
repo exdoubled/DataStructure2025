@@ -130,10 +130,10 @@ def main() -> int:
 
     combos_iter = itertools.product(
         [16, 32],
-        range(400, 1001, 100),
+        range(800, 1001, 100),
         [70, 100, 150, 200],
-        range(50, 101, 10),
-        [20, 25, 30],
+        range(50, 71, 10),
+        [25, 30],
     )
 
     checker_exe = repo_root / "checker.exe"
