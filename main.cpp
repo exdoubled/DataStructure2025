@@ -6,6 +6,7 @@
 主要作用是生成 query 文件和运行出一份暴力文件供 checker.cpp 使用对拍
 在终端中运行：
 ./main.exe 0 --gen-queries
+--save-bin-base 实现如果不能自动从 base.bin 读取基数据，则从 base.txt 读取后保存为 base.bin
 可以生成 query.txt 文件，0 代表使用 GloVe 数据集，1 代表使用 SIFT 数据集
 运行时可指定算法：--algo=solution 或 --algo=brute 分别代表使用 MySolution 和 Brute 进行搜索
 */
@@ -137,6 +138,14 @@ static size_t load_base_vectors_auto(const std::string &base_txt_path, int expec
     // 回退到文本读取
     size_t read = load_flat_vectors_from_txt(base_txt_path, expected_dim, pointsnum, out_flat);
     out_dim_actual = expected_dim;
+    if (read > 0 && !base_txt_path.empty()) {
+        std::string bin_path = replace_base_txt_with_bin(base_txt_path, "base.bin");
+        if (binio::write_vecbin(bin_path, out_dim_actual, out_flat)) {
+            std::cerr << "Saved base to bin: " << bin_path << " (N=" << read << ")\n";
+        } else {
+            std::cerr << "[WARN] Failed to save base bin: " << bin_path << "\n";
+        }
+    }
     return read;
 }
 

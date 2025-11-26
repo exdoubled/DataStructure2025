@@ -667,7 +667,7 @@ public:
         
         // 第0层：添加反向边 + 剪枝
         addReverseEdgesDirectly(0, 160);
-        pruneRedundantPathsDirectly(0, 24);
+        pruneRedundantPathsDirectly(0, 40);
         
         if (optimize_high_layers && max_level > 0) {
             for (int level = 1; level <= max_level; ++level) {

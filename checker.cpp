@@ -143,6 +143,14 @@ static size_t load_base_vectors_auto(const std::string &base_txt_path, int expec
     }
     size_t read = load_flat_vectors_from_txt(base_txt_path, expected_dim, max_count, out_flat);
     out_dim_actual = expected_dim;
+    if (read > 0 && !base_txt_path.empty()) {
+        std::string bin_path = replace_base_txt_with_bin(base_txt_path, "base.bin");
+        if (binio::write_vecbin(bin_path, out_dim_actual, out_flat)) {
+            std::cerr << "Saved base to bin: " << bin_path << " (N=" << read << ")\n";
+        } else {
+            std::cerr << "[WARN] Failed to save base bin: " << bin_path << "\n";
+        }
+    }
     return read;
 }
 
