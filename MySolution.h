@@ -666,8 +666,8 @@ public:
         int max_level = maxlevel_.load(std::memory_order_acquire);
         
         // 第0层：添加反向边 + 剪枝
-        addReverseEdgesDirectly(0, 160);
-        pruneRedundantPathsDirectly(0, 40);
+        addReverseEdgesDirectly(0, 240);
+        pruneRedundantPathsDirectly(0, 30);
         
         if (optimize_high_layers && max_level > 0) {
             for (int level = 1; level <= max_level; ++level) {
