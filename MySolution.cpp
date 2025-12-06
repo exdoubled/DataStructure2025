@@ -14,7 +14,7 @@ void Solution::build(int d, const vector<float>& base) {
 
     // ==================== HNSW 初始化 ====================
     // 分别代表：max_elements, M, random_seed, ef_construction, ef, data_size, worker_count
-    initHNSW(n, 48, 114514, 400, 800, data_size_, worker_count);
+    initHNSW(n, 48, 114514, 400, 900, data_size_, worker_count);  // ef: 800->900 提升recall
 
     // 单线程插入
     if (worker_count_ == 1) {
@@ -46,25 +46,12 @@ void Solution::build(int d, const vector<float>& base) {
     }
 
     // ==================== ONNG 优化 ====================
-    optimizeGraphDirectly(true);
-    
+    optimizeGraphDirectly(false, 64, 140, 40);  // e_o=64, e_i=84, min=48
+
     
 }
 
 void Solution::search(const vector<float>& query, int *res) {
     // SearchDistanceScope distance_scope(*this); // 记得注释距离计算的计数器
-    const size_t k = 10;
-
-    auto pq = searchKnn(query.data(), k);
-
-    vector<distPair> buf;
-    buf.reserve(pq.size());
-    while (!pq.empty()) { buf.push_back(pq.top()); pq.pop(); }
-    reverse(buf.begin(), buf.end());
-
-    size_t i = 0;
-    for (; i < buf.size() && i < k; ++i) {
-        tableint id = buf[i].second;
-        res[i] = static_cast<int>(id);
-    }
+    searchKnn(query.data(), 10, res);
 }
