@@ -561,6 +561,30 @@ public:
         int max_level = maxlevel_.load(memory_order_acquire);
         maxOnngLevel = (maxOnngLevel <= 0) ? max_level : maxOnngLevel;
 
+        // ============ 强制中心化入口 ============
+        // 计算所有点的几何质心，并选择离质心最近的点作为新的 enterpoint
+        size_t node_count = cur_element_count.load(memory_order_acquire);
+        if (node_count > 0 && dim_ > 0) {
+            vector<float> centroid(dim_, 0.0f);
+            for (tableint id = 0; id < static_cast<tableint>(node_count); ++id) {
+                const float* v = getDataByInternalId(id);
+                for (size_t d = 0; d < dim_; ++d) centroid[d] += v[d];
+            }
+            float inv_n = 1.0f / static_cast<float>(node_count);
+            for (size_t d = 0; d < dim_; ++d) centroid[d] *= inv_n;
+
+            tableint best_id = 0;
+            dist_t best_dist = numeric_limits<dist_t>::max();
+            for (tableint id = 0; id < static_cast<tableint>(node_count); ++id) {
+                dist_t d = L2Distance(centroid.data(), getDataByInternalId(id));
+                if (d < best_dist) {
+                    best_dist = d;
+                    best_id = id;
+                }
+            }
+            enterpoint_node_.store(best_id, memory_order_release);
+        }
+
         size_t e_o_l0 = e_o;
         size_t e_i_l0 = e_i;
         size_t min_l0 = minEdges / 10 * 9;
@@ -625,6 +649,12 @@ public:
 
     default_random_engine level_generator_; // 用于生成随机层数的随机数
 
+    // 逻辑 ID (原始下标) 与物理 ID (内部存储下标) 映射
+    // 构建时：logical_id = 插入顺序/原始下标；physical_id = 内部数组下标
+    // 外部接口始终使用逻辑 ID，内部存图和搜索全部使用物理 ID
+    vector<tableint> logical_to_physical_;
+    vector<tableint> physical_to_logical_;
+
     void initHNSW(
         size_t max_elements,
         size_t M = 16,
@@ -665,6 +695,10 @@ public:
         // 层数记录
         element_levels_.assign(max_elements_, 0);
 
+        // ID 映射表
+        logical_to_physical_.assign(max_elements_, static_cast<tableint>(-1));
+        physical_to_logical_.assign(max_elements_, static_cast<tableint>(-1));
+
         // 邻接锁
         link_list_locks_.reset(new mutex[max_elements_]);
 
@@ -689,17 +723,21 @@ public:
         maxlevel_.store(-1, memory_order_relaxed);
         has_enterpoint_.store(false, memory_order_relaxed);
         link_list_locks_.reset();
+
+        logical_to_physical_.clear();
+        physical_to_logical_.clear();
     }
 
 
     // 获取节点数据指针
     inline const float *getDataByInternalId(tableint id) const {
+        // 这里的 id 应为物理 ID
         return reinterpret_cast<const float*>(data_level0_memory_ + id * size_data_per_element_ + offsetData_);
     }
 
     // 获取第 0 层的邻居列表指针，不直接使用，需通过 getLinkListAtLevel 调用
     linklistsizeint *get_linklist0(tableint id) const {
-        return (linklistsizeint *) (data_level0_memory_ + id * size_data_per_element_ + offsetLevel0_);
+    return (linklistsizeint *) (data_level0_memory_ + id * size_data_per_element_ + offsetLevel0_);
     }
 
     // 获取第 1 层及以上的邻居列表指针，不直接使用，需通过 getLinkListAtLevel 调用
@@ -788,7 +826,7 @@ public:
     4. 对每个邻居，计算距离，若满足条件加入候选集和结果集
     5. 终止条件：候选集最近的点比结果集最远的还远，且结果集已满
     */
-    MaxHeap4 searchLayer(
+MaxHeap4 searchLayer(
         tableint ep_id,
         const float *query,
         int layer,
@@ -802,7 +840,6 @@ public:
 
         dist_t lowerBound = dist;       // 当前结果集中的最大距离
 
-        // 多线程实现，使用 thread_local bitset + token，避免每次清空和大内存
         thread_local vector<uint64_t> visit_bitmap_tls;
         thread_local vector<uint32_t> visit_epoch_tls;
         thread_local uint32_t visit_token_tls = 1u;
@@ -820,18 +857,11 @@ public:
             fill(visit_epoch_tls.begin(), visit_epoch_tls.end(), 0u);
             visit_token_tls = 1u;
         }
-
         auto touch_word = [&](size_t word_idx) {
             if (visit_epoch_tls[word_idx] != visit_token_tls) {
                 visit_epoch_tls[word_idx] = visit_token_tls;
                 visit_bitmap_tls[word_idx] = 0ull;
             }
-        };
-        auto mark_visited = [&](tableint id) {
-            size_t word = static_cast<size_t>(id) >> 6;
-            size_t bit = static_cast<size_t>(id) & 63ull;
-            touch_word(word);
-            visit_bitmap_tls[word] |= (1ull << bit);
         };
         auto is_visited = [&](tableint id) -> bool {
             size_t word = static_cast<size_t>(id) >> 6;
@@ -839,19 +869,24 @@ public:
             touch_word(word);
             return (visit_bitmap_tls[word] >> bit) & 1ull;
         };
+        auto mark_visited = [&](tableint id) {
+            size_t word = static_cast<size_t>(id) >> 6;
+            size_t bit = static_cast<size_t>(id) & 63ull;
+            touch_word(word);
+            visit_bitmap_tls[word] |= (1ull << bit);
+        };
 
         mark_visited(ep_id);
 
         while (!candidate_set.empty()) {
             auto currPair = candidate_set.top();
-
-            // 终止条件：候选集最近的点比结果集最远的还远，且结果集已满
-            if ((-currPair.first) > lowerBound && top_candidates.size() == ef_limit) break;
             
-            candidate_set.pop();
+            // 剪枝检查
+            if ((-currPair.first) > lowerBound && top_candidates.size() == ef_limit) break;
 
+            candidate_set.pop();
             tableint curID = currPair.second;
-            // 预取邻居数据
+
             linklistsizeint* ll = getLinkListAtLevel(curID, layer);
             int size = getListCount(ll);
             const tableint* data = getNeighborsArray(ll);
@@ -863,26 +898,17 @@ public:
                 tableint candidateID = data[i];
                 if (is_visited(candidateID)) continue;
                 mark_visited(candidateID);
-
                 dist_t d = L2Distance(query, getDataByInternalId(candidateID));
-
                 if (top_candidates.size() < ef_limit || d < lowerBound) {
                     candidate_set.emplace(-d, candidateID);
-
                     top_candidates.emplace(d, candidateID);
-
-                    if (top_candidates.size() > ef_limit) {
-                        top_candidates.pop();
-                    }
-                    if (!top_candidates.empty()) {
-                        lowerBound = top_candidates.top().first;
-                    }
+                    if (top_candidates.size() > ef_limit) top_candidates.pop();
+                    lowerBound = top_candidates.top().first;
                 }
             }
         }
         return top_candidates;
     }
-
 
     // 启发式选邻居：按距离排序后，选择与已选邻居保持多样性的节点
     void selectNeighborsHeuristic(MaxHeap4& topCandidates, size_t M) {
@@ -976,18 +1002,23 @@ public:
         if (cur_c >= max_elements_)
             throw runtime_error("HNSW capacity exceeded");
 
+        tableint logical_id = cur_c;
+        tableint physical_id = cur_c;
+        logical_to_physical_[logical_id] = physical_id;
+        physical_to_logical_[physical_id] = logical_id;
+
         bool is_first = (cur_c == 0);
 
         // 随机初始化层数
         int curlevel = generateRandomLevel(mult_);
         if(level > 0) curlevel = level;
 
-        element_levels_[cur_c] = curlevel;
+        element_levels_[physical_id] = curlevel;
         tableint currObj = enterpoint_node_.load(memory_order_acquire);
         tableint enterpoint_copy = currObj;
 
 
-        char* base_ptr = data_level0_memory_ + cur_c * size_data_per_element_;
+        char* base_ptr = data_level0_memory_ + physical_id * size_data_per_element_;
 
         // 写入向量数据
         memcpy(base_ptr + offsetData_, vec, data_size_);
@@ -1006,7 +1037,7 @@ public:
         }
 
         if (is_first) {
-            enterpoint_node_.store(cur_c, memory_order_release);
+            enterpoint_node_.store(physical_id, memory_order_release);
             maxlevel_.store(curlevel, memory_order_release);
             has_enterpoint_.store(true, memory_order_release);
             return;
@@ -1045,13 +1076,13 @@ public:
                 for (int lvl = min(curlevel, maxLevelSnapshot); lvl >= 0; lvl--) {
                     auto top_candidates = searchLayer(currObj, vec, lvl, ef_construction_);
                     // 这里把 Algorithm 1 后面的部分 合并到连接邻居一起实现了
-                    currObj = mutuallyConnectNewElement(cur_c, top_candidates, lvl);
+                    currObj = mutuallyConnectNewElement(physical_id, top_candidates, lvl);
                 }
             } else {
                 tableint ep = enterpoint_copy;
                 for (int lvl = maxLevelSnapshot; lvl >= 0; --lvl) {
                     auto top_candidates = searchLayer(ep, vec, lvl, ef_construction_);
-                    ep = mutuallyConnectNewElement(cur_c, top_candidates, lvl);
+                    ep = mutuallyConnectNewElement(physical_id, top_candidates, lvl);
                 }
                 bool updated = false;
                 int expected = maxLevelSnapshot;
@@ -1062,7 +1093,7 @@ public:
                     }
                 }
                 if (updated) {
-                    enterpoint_node_.store(cur_c, memory_order_release);
+                    enterpoint_node_.store(physical_id, memory_order_release);
                 }
             }
         }
@@ -1110,7 +1141,10 @@ public:
         
         // 现在 data_ 已按距离升序排列，直接顺序写入
         for (size_t i = 0; i < result_count; ++i) {
-            res[i] = static_cast<int>(top_candidates[i].second);
+            // 将内部物理 ID 映射回逻辑 ID（原始下标）
+            tableint physical_id = top_candidates[i].second;
+            tableint logical_id = (physical_id < physical_to_logical_.size()) ? physical_to_logical_[physical_id] : physical_id;
+            res[i] = static_cast<int>(logical_id);
         }
         for (size_t i = result_count; i < k; ++i) {
             res[i] = -1;
@@ -1161,6 +1195,175 @@ private:
 
     mutable atomic<uint64_t> query_distance_calcs_{0};
     mutable atomic<uint64_t> query_count_{0};
+
+
+    // ====================== 节点重排（BFS） =========================
+    // 以提升访问局部性
+    void reorderNodesByBFS() {
+        size_t node_count = cur_element_count.load(memory_order_acquire);
+        if (node_count == 0) return;
+
+        vector<vector<tableint>> adj(node_count);
+        adj.assign(node_count, {});
+
+        for (tableint u = 0; u < static_cast<tableint>(node_count); ++u) {
+            if (0 > element_levels_[u]) continue; // 理论上不会发生
+            linklistsizeint* ll = getLinkListAtLevel(u, 0);
+            int sz = getListCount(ll);
+            const tableint* ng = getNeighborsArray(ll);
+            for (int i = 0; i < sz; ++i) {
+                tableint v = ng[i];
+                if (v >= node_count) continue;
+                adj[u].push_back(v);
+                adj[v].push_back(u);
+            }
+        }
+
+        vector<tableint> order;
+        order.reserve(node_count);
+        vector<char> visited(node_count, 0);
+
+        auto bfs_from = [&](tableint start) {
+            if (start >= node_count || visited[start]) return;
+            queue<tableint> q;
+            visited[start] = 1;
+            q.push(start);
+            while (!q.empty()) {
+                tableint u = q.front();
+                q.pop();
+                order.push_back(u);
+                const auto& nbrs = adj[u];
+                for (tableint v : nbrs) {
+                    if (v < node_count && !visited[v]) {
+                        visited[v] = 1;
+                        q.push(v);
+                    }
+                }
+            }
+        };
+
+        tableint ep = enterpoint_node_.load(memory_order_acquire);
+        if (ep < node_count) bfs_from(ep);
+        for (tableint i = 0; i < static_cast<tableint>(node_count); ++i) {
+            if (!visited[i]) bfs_from(i);
+        }
+
+        if (order.size() != node_count) return;
+
+        vector<tableint> old_to_new(node_count);
+        for (tableint new_id = 0; new_id < static_cast<tableint>(node_count); ++new_id) {
+            tableint old_id = order[new_id];
+            old_to_new[old_id] = new_id;
+        }
+
+        size_t bytes_total = max_elements_ * size_data_per_element_;
+        char* new_data_level0 = (char*)malloc(bytes_total);
+        if (!new_data_level0) return; 
+
+        for (tableint new_id = 0; new_id < static_cast<tableint>(node_count); ++new_id) {
+            tableint old_id = order[new_id];
+            char* old_base = data_level0_memory_ + old_id * size_data_per_element_;
+            char* new_base = new_data_level0 + new_id * size_data_per_element_;
+
+            memcpy(new_base, old_base, size_data_per_element_);
+
+            linklistsizeint* ll = reinterpret_cast<linklistsizeint*>(new_base + offsetLevel0_);
+            int sz = getListCount(ll);
+            tableint* arr = getNeighborsArray(ll);
+            for (int i = 0; i < sz; ++i) {
+                tableint old_nbr = arr[i];
+                if (old_nbr < node_count) {
+                    arr[i] = old_to_new[old_nbr];
+                }
+            }
+        }
+
+        if (node_count < max_elements_) {
+            size_t remain = (max_elements_ - node_count) * size_data_per_element_;
+            memcpy(new_data_level0 + node_count * size_data_per_element_,
+                   data_level0_memory_ + node_count * size_data_per_element_,
+                   remain);
+        }
+
+        char** new_linkLists = (char**)malloc(sizeof(void*) * max_elements_);
+        if (!new_linkLists) {
+            free(new_data_level0);
+            return;
+        }
+
+        vector<int> new_levels(max_elements_);
+
+        for (tableint new_id = 0; new_id < static_cast<tableint>(node_count); ++new_id) {
+            tableint old_id = order[new_id];
+            new_levels[new_id] = element_levels_[old_id];
+
+            if (element_levels_[old_id] > 0 && linkLists_[old_id]) {
+                size_t bytes = size_links_per_element_ * element_levels_[old_id];
+                char* new_links = (char*)malloc(bytes);
+                if (!new_links) {
+                    new_linkLists[new_id] = nullptr;
+                    continue;
+                }
+                memcpy(new_links, linkLists_[old_id], bytes);
+
+                for (int lvl = 1; lvl <= element_levels_[old_id]; ++lvl) {
+                    linklistsizeint* ll = get_linklist(old_id, lvl);
+                    int sz = getListCount(ll);
+                    tableint* old_arr = getNeighborsArray(ll);
+
+                    linklistsizeint* new_ll = reinterpret_cast<linklistsizeint*>(new_links + (lvl - 1) * size_links_per_element_);
+                    tableint* new_arr = getNeighborsArray(new_ll);
+
+                    for (int i = 0; i < sz; ++i) {
+                        tableint old_nbr = old_arr[i];
+                        if (old_nbr < node_count) {
+                            new_arr[i] = old_to_new[old_nbr];
+                        }
+                    }
+                }
+                new_linkLists[new_id] = new_links;
+            } else {
+                new_linkLists[new_id] = nullptr;
+            }
+        }
+
+        // 其余未使用部分直接保持为空
+        for (tableint id = static_cast<tableint>(node_count); id < static_cast<tableint>(max_elements_); ++id) {
+            new_linkLists[id] = (id < max_elements_) ? linkLists_[id] : nullptr;
+            new_levels[id] = element_levels_[id];
+        }
+
+        tableint old_ep = enterpoint_node_.load(memory_order_acquire);
+        if (old_ep < node_count) {
+            enterpoint_node_.store(old_to_new[old_ep], memory_order_release);
+        }
+
+
+        vector<tableint> new_physical_to_logical(max_elements_, static_cast<tableint>(-1));
+        for (tableint old_phys = 0; old_phys < static_cast<tableint>(node_count); ++old_phys) {
+            tableint new_phys = old_to_new[old_phys];
+            tableint logical = physical_to_logical_[old_phys];
+            if (logical != static_cast<tableint>(-1)) {
+                new_physical_to_logical[new_phys] = logical;
+                if (logical < logical_to_physical_.size()) {
+                    logical_to_physical_[logical] = new_phys;
+                }
+            }
+        }
+        for (tableint id = 0; id < static_cast<tableint>(node_count); ++id) {
+            if (element_levels_[id] > 0 && linkLists_[id]) {
+                free(linkLists_[id]);
+            }
+        }
+
+        free(linkLists_);
+        free(data_level0_memory_);
+
+        data_level0_memory_ = new_data_level0;
+        linkLists_ = new_linkLists;
+        element_levels_.swap(new_levels);
+        physical_to_logical_.swap(new_physical_to_logical);
+    }
 
 
 };
