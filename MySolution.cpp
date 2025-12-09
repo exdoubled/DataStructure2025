@@ -14,7 +14,7 @@ void Solution::build(int d, const vector<float>& base) {
 
     // ==================== HNSW 初始化 ====================
     // 分别代表：max_elements, M, random_seed, ef_construction, ef, data_size, worker_count
-    initHNSW(n, 48, 114514, 400, 640, data_size_, worker_count); 
+    initHNSW(n, 48, 114514, 400, 704, data_size_, worker_count); 
 
     // 单线程插入
     if (worker_count_ == 1) {
