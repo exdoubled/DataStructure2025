@@ -10,6 +10,8 @@
 --ans=<path>       指定答案文件路径，默认为 Config 中 "./ans.txt"
 --algo=<name>     指定使用的算法，solution 或 brute，默认为 solution
 --first=<N>       只对拍前 N 条查询，默认为全部
+--save-graph[=path] 构建后保存图结构缓存，默认路径由 Config.h 定义
+--load-graph[=path] 从缓存文件加载图结构（跳过构建），默认路径由 Config.h 定义
 选项无顺序要求
 */
 /*
@@ -19,6 +21,8 @@
 ./checker.exe 1 --ans="./ans.txt" --algo=solution --first=100
 ./checker.exe 0 --ans="./ans.txt" --algo=solution
 ./checker.exe 1 --ans="./ans.txt" --algo=solution
+./checker.exe 0 --save-graph --ans="./ans.txt" --algo=solution
+./checker.exe 0 --load-graph --ans="./ans.txt" --algo=solution
 */
 
 
@@ -446,6 +450,11 @@ int main(int argc, char** argv) {
     bool save_bin_base = false;
     
     bool force_bin = false;         // 仅从 .bin 读取
+    
+    // 图结构缓存选项
+    bool save_graph = false;
+    bool load_graph = false;
+    std::string graph_cache_path;   // 用户指定的路径，为空则自动生成
 
     // Parse args
     auto is_unsigned_integer = [](const std::string &s) -> bool {
@@ -484,7 +493,29 @@ int main(int argc, char** argv) {
         } else if (a == "--bin") {
             force_bin = true;
         }
+        // 图结构缓存参数
+        else if (a == "--save-graph") {
+            save_graph = true;
+        } else if (a.rfind("--save-graph=", 0) == 0) {
+            save_graph = true;
+            graph_cache_path = a.substr(13);
+        } else if (a == "--load-graph") {
+            load_graph = true;
+        } else if (a.rfind("--load-graph=", 0) == 0) {
+            load_graph = true;
+            graph_cache_path = a.substr(13);
+        }
     }
+
+    // 生成默认的图缓存路径（使用 Config.h 中定义的路径）
+    auto get_default_graph_path = [](int ds_case) -> std::string {
+        switch (ds_case) {
+            case 0: return GRAPH_CACHE_GLOVE;
+            case 1: return GRAPH_CACHE_SIFT;
+            case 2: return GRAPH_CACHE_TEST;
+            default: return GRAPH_CACHE_DEFAULT;
+        }
+    };
 
     // Load base data
     GroundTruth gt;
@@ -644,17 +675,45 @@ int main(int argc, char** argv) {
     double avg_distance_calcs = 0.0;
     bool has_distance_stats = false;
 
+    // 确定图缓存路径
+    std::string actual_graph_path = graph_cache_path.empty() ? get_default_graph_path(dataset_case) : graph_cache_path;
+
     auto search_start_tp = std::chrono::high_resolution_clock::now();
     if (algo == "solution") {
         Solution sol;
+        bool graph_loaded = false;
+        
         auto t_build_start = std::chrono::high_resolution_clock::now();
-        sol.build(dim, base_data);
-    //#ifdef CPP_SOLUTION_FAKE_STD_SYNC
-    //    std::fprintf(stderr, "[checker] threading disabled (fallback)\n");
-    //#else
-    //    std::fprintf(stderr, "[checker] threading enabled, worker_count=%zu (hc=%u)\n",
-    //             sol.worker_count_, std::thread::hardware_concurrency());
-    //#endif
+        
+        // 尝试从缓存加载图
+        if (load_graph) {
+            if (Solution::isGraphCacheValid(actual_graph_path, dim, loaded)) {
+                if (sol.loadGraph(actual_graph_path)) {
+                    graph_loaded = true;
+                    std::cerr << "[checker] Graph loaded from cache: " << actual_graph_path << "\n";
+                } else {
+                    std::cerr << "[checker] Failed to load graph cache, will build from scratch.\n";
+                }
+            } else {
+                std::cerr << "[checker] Graph cache invalid or mismatch (dim=" << dim << ", N=" << loaded 
+                          << "), will build from scratch.\n";
+            }
+        }
+        
+        // 如果没有加载成功，则构建
+        if (!graph_loaded) {
+            sol.build(dim, base_data);
+            
+            // 保存图缓存
+            if (save_graph) {
+                if (sol.saveGraph(actual_graph_path)) {
+                    std::cerr << "[checker] Graph saved to: " << actual_graph_path << "\n";
+                } else {
+                    std::cerr << "[checker] Failed to save graph to: " << actual_graph_path << "\n";
+                }
+            }
+        }
+        
         if(ENABLE_PROGRESS) {
             progress_bar("Building index", 1, 1, t_build_start);
         }

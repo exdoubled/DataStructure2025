@@ -22,6 +22,8 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "BinaryIO.h"
+
 // SIMD 指令集相关
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386) || defined(_M_IX86)
 #define SOLUTION_PLATFORM_X86 1
@@ -908,6 +910,143 @@ public:
     void build(int d, const vector<float>& base);
 
     void search(const vector<float>& query, int *res);
+
+    // ====================== 图结构缓存 I/O =========================
+    // 保存图结构到二进制文件
+    bool saveGraph(const std::string &path) const {
+        size_t node_count = cur_element_count.load(std::memory_order_acquire);
+        if (node_count == 0 || data_level0_memory_ == nullptr) {
+            std::cerr << "[saveGraph] No graph data to save.\n";
+            return false;
+        }
+
+        // 准备 entry_points 转换为 uint32_t
+        std::vector<uint32_t> ep_u32(entry_points_.begin(), entry_points_.end());
+
+        // 准备 ID 映射表转换为 uint32_t
+        std::vector<uint32_t> l2p_u32(node_count);
+        std::vector<uint32_t> p2l_u32(node_count);
+        for (size_t i = 0; i < node_count; ++i) {
+            l2p_u32[i] = static_cast<uint32_t>(logical_to_physical_[i]);
+            p2l_u32[i] = static_cast<uint32_t>(physical_to_logical_[i]);
+        }
+
+        bool ok = binio::write_graph_cache(
+            path,
+            static_cast<uint32_t>(dim_),
+            static_cast<uint64_t>(max_elements_),
+            static_cast<uint64_t>(node_count),
+            static_cast<uint32_t>(maxM0_),
+            static_cast<uint32_t>(ef_construction_),
+            static_cast<uint64_t>(size_data_per_element_),
+            static_cast<uint64_t>(size_links_level0_),
+            static_cast<uint64_t>(offsetData_),
+            static_cast<uint64_t>(offsetLevel0_),
+            static_cast<uint64_t>(data_size_),
+            data_level0_memory_,
+            ep_u32,
+            l2p_u32,
+            p2l_u32
+        );
+
+        if (ok) {
+            std::cerr << "[saveGraph] Graph saved to: " << path 
+                      << " (nodes=" << node_count << ", dim=" << dim_ << ")\n";
+        } else {
+            std::cerr << "[saveGraph] Failed to save graph to: " << path << "\n";
+        }
+        return ok;
+    }
+
+    // 从二进制文件加载图结构
+    bool loadGraph(const std::string &path) {
+        uint32_t dim;
+        uint64_t max_elements, cur_count, size_data_per_elem, size_links_l0, off_data, off_l0, data_sz;
+        uint32_t maxM0, ef_cons;
+        std::vector<char> data_mem;
+        std::vector<uint32_t> ep_u32, l2p_u32, p2l_u32;
+
+        if (!binio::read_graph_cache(
+                path, dim, max_elements, cur_count, maxM0, ef_cons,
+                size_data_per_elem, size_links_l0, off_data, off_l0, data_sz,
+                data_mem, ep_u32, l2p_u32, p2l_u32)) {
+            std::cerr << "[loadGraph] Failed to read graph from: " << path << "\n";
+            return false;
+        }
+
+        // 清理现有数据
+        if (data_level0_memory_ != nullptr) {
+            free(data_level0_memory_);
+            data_level0_memory_ = nullptr;
+        }
+
+        // 恢复参数
+        dim_ = static_cast<size_t>(dim);
+        max_elements_ = static_cast<size_t>(max_elements);
+        maxM0_ = static_cast<size_t>(maxM0);
+        ef_construction_ = static_cast<size_t>(ef_cons);
+        size_data_per_element_ = static_cast<size_t>(size_data_per_elem);
+        size_links_level0_ = static_cast<size_t>(size_links_l0);
+        offsetData_ = static_cast<size_t>(off_data);
+        offsetLevel0_ = static_cast<size_t>(off_l0);
+        data_size_ = static_cast<size_t>(data_sz);
+        cur_element_count.store(static_cast<size_t>(cur_count), std::memory_order_release);
+
+        // 分配并复制 data_level0_memory
+        size_t total_mem = max_elements_ * size_data_per_element_;
+        data_level0_memory_ = (char*)malloc(total_mem);
+        if (!data_level0_memory_) {
+            std::cerr << "[loadGraph] Memory allocation failed.\n";
+            return false;
+        }
+        std::memset(data_level0_memory_, 0, total_mem);
+        size_t used_mem = cur_count * size_data_per_element_;
+        if (used_mem > 0 && !data_mem.empty()) {
+            std::memcpy(data_level0_memory_, data_mem.data(), used_mem);
+        }
+
+        // 恢复 entry_points
+        entry_points_.assign(ep_u32.begin(), ep_u32.end());
+
+        // 恢复 ID 映射表
+        logical_to_physical_.assign(max_elements_, static_cast<tableint>(-1));
+        physical_to_logical_.assign(max_elements_, static_cast<tableint>(-1));
+        for (size_t i = 0; i < cur_count && i < l2p_u32.size(); ++i) {
+            logical_to_physical_[i] = static_cast<tableint>(l2p_u32[i]);
+        }
+        for (size_t i = 0; i < cur_count && i < p2l_u32.size(); ++i) {
+            physical_to_logical_[i] = static_cast<tableint>(p2l_u32[i]);
+        }
+
+        // 重新初始化锁
+        link_list_locks_.reset(new std::mutex[max_elements_]);
+
+        // 设置入口点（用于兼容性）
+        if (!entry_points_.empty()) {
+            enterpoint_node_.store(entry_points_[0], std::memory_order_release);
+        } else if (cur_count > 0) {
+            enterpoint_node_.store(0, std::memory_order_release);
+        }
+
+        std::cerr << "[loadGraph] Graph loaded from: " << path 
+                  << " (nodes=" << cur_count << ", dim=" << dim_ << ", ep_count=" << entry_points_.size() << ")\n";
+        return true;
+    }
+
+    // 检查图缓存是否有效（用于判断是否需要重建）
+    static bool isGraphCacheValid(const std::string &path, int expected_dim, size_t expected_count) {
+        binio::GraphCacheHeader header;
+        if (!binio::read_graph_cache_header(path, header)) {
+            return false;
+        }
+        if (expected_dim > 0 && header.dim != static_cast<uint32_t>(expected_dim)) {
+            return false;
+        }
+        if (expected_count > 0 && header.cur_element_count != static_cast<uint64_t>(expected_count)) {
+            return false;
+        }
+        return true;
+    }
 
     double getAverageDistanceCalcsPerSearch() const {
         uint64_t searches = query_count_.load(memory_order_relaxed);

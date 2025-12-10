@@ -1,6 +1,8 @@
 // 编译：& 'C:/TDM-GCC-64/bin/g++.exe' -std=c++17 -O2 -Wall -Wextra -pthread -o './main.exe' './main.cpp' './MySolution.cpp' './Brute.cpp'
 // 用法：./main.exe 0/1 --gen-queries  生成 query
 // 用法：./main.exe 0/1 [--algo=solution|brute] 运行，默认 solution（使用 MySolution）
+// 用法：./main.exe 0/1 --save-graph[=path]  构建图后保存到缓存文件
+// 用法：./main.exe 0/1 --load-graph[=path]  从缓存文件加载图（跳过构建）
 
 /*
 主要作用是生成 query 文件和运行出一份暴力文件供 checker.cpp 使用对拍
@@ -9,6 +11,8 @@
 --save-bin-base 实现如果不能自动从 base.bin 读取基数据，则从 base.txt 读取后保存为 base.bin
 可以生成 query.txt 文件，0 代表使用 GloVe 数据集，1 代表使用 SIFT 数据集
 运行时可指定算法：--algo=solution 或 --algo=brute 分别代表使用 MySolution 和 Brute 进行搜索
+--save-graph[=path] 构建完成后保存图结构缓存，默认路径为 "graph_<dataset>.bin"
+--load-graph[=path] 从缓存文件加载图结构（跳过构建），默认路径同上
 */
 
 #include <chrono>
@@ -443,6 +447,11 @@ int main(int argc, char** argv) {
     bool force_bin = false;
     // 查询文件路径覆盖（txt 或 bin，取决于 --bin）
     std::string query_override;
+    // 图结构缓存选项
+    bool save_graph = false;
+    bool load_graph = false;
+    std::string graph_cache_path; // 用户指定的路径，为空则自动生成
+
         auto is_unsigned_integer = [](const std::string &s) -> bool {
             if (s.empty()) return false;
             for (char c : s) if (!std::isdigit((unsigned char)c)) return false;
@@ -459,10 +468,25 @@ int main(int argc, char** argv) {
             else if (arg == "--bin") { force_bin = true; }
             else if (arg == "--query" && i + 1 < argc) { query_override = argv[++i]; }
             else if (arg.rfind("--query=", 0) == 0) { query_override = arg.substr(8); }
+            // 图结构缓存参数
+            else if (arg == "--save-graph") { save_graph = true; }
+            else if (arg.rfind("--save-graph=", 0) == 0) { save_graph = true; graph_cache_path = arg.substr(13); }
+            else if (arg == "--load-graph") { load_graph = true; }
+            else if (arg.rfind("--load-graph=", 0) == 0) { load_graph = true; graph_cache_path = arg.substr(13); }
             else if (is_unsigned_integer(arg)) {
                 dataset_case = std::atoi(arg.c_str());
             }
     }
+
+    // 生成默认的图缓存路径（使用 Config.h 中定义的路径）
+    auto get_default_graph_path = [](int ds_case) -> std::string {
+        switch (ds_case) {
+            case 0: return GRAPH_CACHE_GLOVE;
+            case 1: return GRAPH_CACHE_SIFT;
+            case 2: return GRAPH_CACHE_TEST;
+            default: return GRAPH_CACHE_DEFAULT;
+        }
+    };
 
     read_data(dataset_case);
 
@@ -686,6 +710,9 @@ int main(int argc, char** argv) {
     const int k = 10;
     result.assign(num_queries, std::vector<int>(k, -1));
 
+    // 确定图缓存路径
+    std::string actual_graph_path = graph_cache_path.empty() ? get_default_graph_path(dataset_case) : graph_cache_path;
+
     // Build/Search
     std::chrono::duration<double> build_duration{0};
     std::chrono::duration<double> search_duration{0};
@@ -693,22 +720,55 @@ int main(int argc, char** argv) {
     if (RUN_FIRST_N > 0) processed_queries = std::min(num_queries, RUN_FIRST_N);
     
     if (algo == "solution") {
-        // Build
-        auto start1 = std::chrono::high_resolution_clock::now();
-        solution.build(dim, base_data);
-#ifdef CPP_SOLUTION_FAKE_STD_SYNC
-        std::fprintf(stderr, "[main] threading disabled (fallback)\n");
-#else
-        std::fprintf(stderr, "[main] threading enabled, worker_count=%zu (hc=%u)\n",
-                     solution.worker_count_, std::thread::hardware_concurrency());
-#endif
-        if(ENABLE_PROGRESS) {
-            progress_bar("Building", N, N, start1);
+        bool graph_loaded = false;
+        
+        // 尝试从缓存加载图
+        if (load_graph) {
+            auto load_start = std::chrono::high_resolution_clock::now();
+            if (Solution::isGraphCacheValid(actual_graph_path, dim, N)) {
+                if (solution.loadGraph(actual_graph_path)) {
+                    graph_loaded = true;
+                    auto load_end = std::chrono::high_resolution_clock::now();
+                    build_duration = load_end - load_start;
+                    std::cerr << "[main] Graph loaded from cache: " << actual_graph_path 
+                              << " in " << std::chrono::duration<double>(build_duration).count() << "s\n";
+                } else {
+                    std::cerr << "[main] Failed to load graph cache, will build from scratch.\n";
+                }
+            } else {
+                std::cerr << "[main] Graph cache invalid or mismatch (dim=" << dim << ", N=" << N 
+                          << "), will build from scratch.\n";
+            }
         }
-        auto end1 = std::chrono::high_resolution_clock::now();
-        build_duration = end1 - start1;
-        if (ENABLE_PROGRESS) std::cerr << "[Progress] Build done in " 
-                                       << std::chrono::duration<double>(build_duration).count() << "s\n";
+        
+        // 如果没有加载成功，则构建
+        if (!graph_loaded) {
+            auto start1 = std::chrono::high_resolution_clock::now();
+            solution.build(dim, base_data);
+#ifdef CPP_SOLUTION_FAKE_STD_SYNC
+            std::fprintf(stderr, "[main] threading disabled (fallback)\n");
+#else
+            std::fprintf(stderr, "[main] threading enabled, worker_count=%zu (hc=%u)\n",
+                         solution.worker_count_, std::thread::hardware_concurrency());
+#endif
+            if(ENABLE_PROGRESS) {
+                progress_bar("Building", N, N, start1);
+            }
+            auto end1 = std::chrono::high_resolution_clock::now();
+            build_duration = end1 - start1;
+            if (ENABLE_PROGRESS) std::cerr << "[Progress] Build done in " 
+                                           << std::chrono::duration<double>(build_duration).count() << "s\n";
+            
+            // 保存图缓存
+            if (save_graph) {
+                if (solution.saveGraph(actual_graph_path)) {
+                    std::cerr << "[main] Graph saved to: " << actual_graph_path << "\n";
+                } else {
+                    std::cerr << "[main] Failed to save graph to: " << actual_graph_path << "\n";
+                }
+            }
+        }
+        
         // Search
         auto start2 = std::chrono::high_resolution_clock::now();
         for (int i = 0; i < processed_queries; ++i) {

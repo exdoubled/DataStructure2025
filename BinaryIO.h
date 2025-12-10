@@ -169,4 +169,205 @@ static inline bool read_queries_vecbin(const std::string &path, int expected_dim
     return true;
 }
 
+// ============== Graph Cache I/O ==============
+// Format for HNSW graph cache (little-endian):
+// - magic[8] = "GRAPHC1\0"
+// - uint32 dim
+// - uint64 max_elements
+// - uint64 cur_element_count
+// - uint32 maxM0
+// - uint32 ef_construction
+// - uint64 size_data_per_element
+// - uint64 size_links_level0
+// - uint64 offsetData
+// - uint64 offsetLevel0
+// - uint64 data_size (vector data size in bytes)
+// - uint64 ep_num (number of entry points)
+// - payload: data_level0_memory (cur_element_count * size_data_per_element bytes)
+// - entry_points: ep_num * uint32
+// - logical_to_physical: cur_element_count * uint32
+// - physical_to_logical: cur_element_count * uint32
+
+struct GraphCacheHeader {
+    char magic[8];           // "GRAPHC1\0"
+    uint32_t dim;
+    uint64_t max_elements;
+    uint64_t cur_element_count;
+    uint32_t maxM0;
+    uint32_t ef_construction;
+    uint64_t size_data_per_element;
+    uint64_t size_links_level0;
+    uint64_t offsetData;
+    uint64_t offsetLevel0;
+    uint64_t data_size;
+    uint64_t ep_num;
+};
+
+// Write graph cache to binary file
+static inline bool write_graph_cache(
+    const std::string &path,
+    uint32_t dim,
+    uint64_t max_elements,
+    uint64_t cur_element_count,
+    uint32_t maxM0,
+    uint32_t ef_construction,
+    uint64_t size_data_per_element,
+    uint64_t size_links_level0,
+    uint64_t offsetData,
+    uint64_t offsetLevel0,
+    uint64_t data_size,
+    const char* data_level0_memory,
+    const std::vector<uint32_t>& entry_points,
+    const std::vector<uint32_t>& logical_to_physical,
+    const std::vector<uint32_t>& physical_to_logical
+) {
+    std::ofstream ofs(path, std::ios::binary);
+    if (!ofs.is_open()) return false;
+
+    // Write magic
+    char magic[8] = { 'G','R','A','P','H','C','1','\0' };
+    ofs.write(magic, 8);
+
+    uint8_t buf4[4], buf8[8];
+
+    // Write header fields
+    to_little_endian_u32(dim, buf4); ofs.write(reinterpret_cast<const char*>(buf4), 4);
+    to_little_endian_u64(max_elements, buf8); ofs.write(reinterpret_cast<const char*>(buf8), 8);
+    to_little_endian_u64(cur_element_count, buf8); ofs.write(reinterpret_cast<const char*>(buf8), 8);
+    to_little_endian_u32(maxM0, buf4); ofs.write(reinterpret_cast<const char*>(buf4), 4);
+    to_little_endian_u32(ef_construction, buf4); ofs.write(reinterpret_cast<const char*>(buf4), 4);
+    to_little_endian_u64(size_data_per_element, buf8); ofs.write(reinterpret_cast<const char*>(buf8), 8);
+    to_little_endian_u64(size_links_level0, buf8); ofs.write(reinterpret_cast<const char*>(buf8), 8);
+    to_little_endian_u64(offsetData, buf8); ofs.write(reinterpret_cast<const char*>(buf8), 8);
+    to_little_endian_u64(offsetLevel0, buf8); ofs.write(reinterpret_cast<const char*>(buf8), 8);
+    to_little_endian_u64(data_size, buf8); ofs.write(reinterpret_cast<const char*>(buf8), 8);
+    to_little_endian_u64((uint64_t)entry_points.size(), buf8); ofs.write(reinterpret_cast<const char*>(buf8), 8);
+
+    // Write data_level0_memory
+    if (cur_element_count > 0 && data_level0_memory != nullptr) {
+        uint64_t mem_size = cur_element_count * size_data_per_element;
+        ofs.write(data_level0_memory, (std::streamsize)mem_size);
+    }
+
+    // Write entry_points
+    for (uint32_t ep : entry_points) {
+        to_little_endian_u32(ep, buf4);
+        ofs.write(reinterpret_cast<const char*>(buf4), 4);
+    }
+
+    // Write logical_to_physical
+    for (size_t i = 0; i < cur_element_count && i < logical_to_physical.size(); ++i) {
+        to_little_endian_u32(logical_to_physical[i], buf4);
+        ofs.write(reinterpret_cast<const char*>(buf4), 4);
+    }
+
+    // Write physical_to_logical
+    for (size_t i = 0; i < cur_element_count && i < physical_to_logical.size(); ++i) {
+        to_little_endian_u32(physical_to_logical[i], buf4);
+        ofs.write(reinterpret_cast<const char*>(buf4), 4);
+    }
+
+    return ofs.good();
+}
+
+// Read graph cache header only (for validation)
+static inline bool read_graph_cache_header(const std::string &path, GraphCacheHeader &header) {
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs.is_open()) return false;
+
+    ifs.read(header.magic, 8);
+    if (!ifs || std::strncmp(header.magic, "GRAPHC1\0", 8) != 0) return false;
+
+    uint8_t buf4[4], buf8[8];
+    
+    ifs.read(reinterpret_cast<char*>(buf4), 4); header.dim = from_le_u32(buf4);
+    ifs.read(reinterpret_cast<char*>(buf8), 8); header.max_elements = from_le_u64(buf8);
+    ifs.read(reinterpret_cast<char*>(buf8), 8); header.cur_element_count = from_le_u64(buf8);
+    ifs.read(reinterpret_cast<char*>(buf4), 4); header.maxM0 = from_le_u32(buf4);
+    ifs.read(reinterpret_cast<char*>(buf4), 4); header.ef_construction = from_le_u32(buf4);
+    ifs.read(reinterpret_cast<char*>(buf8), 8); header.size_data_per_element = from_le_u64(buf8);
+    ifs.read(reinterpret_cast<char*>(buf8), 8); header.size_links_level0 = from_le_u64(buf8);
+    ifs.read(reinterpret_cast<char*>(buf8), 8); header.offsetData = from_le_u64(buf8);
+    ifs.read(reinterpret_cast<char*>(buf8), 8); header.offsetLevel0 = from_le_u64(buf8);
+    ifs.read(reinterpret_cast<char*>(buf8), 8); header.data_size = from_le_u64(buf8);
+    ifs.read(reinterpret_cast<char*>(buf8), 8); header.ep_num = from_le_u64(buf8);
+
+    return ifs.good();
+}
+
+// Read full graph cache from binary file
+static inline bool read_graph_cache(
+    const std::string &path,
+    uint32_t &out_dim,
+    uint64_t &out_max_elements,
+    uint64_t &out_cur_element_count,
+    uint32_t &out_maxM0,
+    uint32_t &out_ef_construction,
+    uint64_t &out_size_data_per_element,
+    uint64_t &out_size_links_level0,
+    uint64_t &out_offsetData,
+    uint64_t &out_offsetLevel0,
+    uint64_t &out_data_size,
+    std::vector<char> &out_data_level0_memory,
+    std::vector<uint32_t> &out_entry_points,
+    std::vector<uint32_t> &out_logical_to_physical,
+    std::vector<uint32_t> &out_physical_to_logical
+) {
+    GraphCacheHeader header;
+    if (!read_graph_cache_header(path, header)) return false;
+
+    // Re-open and skip header
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs.is_open()) return false;
+    
+    // Skip header: 8 + 4 + 8 + 8 + 4 + 4 + 8 + 8 + 8 + 8 + 8 + 8 = 84 bytes
+    ifs.seekg(84, std::ios::beg);
+
+    out_dim = header.dim;
+    out_max_elements = header.max_elements;
+    out_cur_element_count = header.cur_element_count;
+    out_maxM0 = header.maxM0;
+    out_ef_construction = header.ef_construction;
+    out_size_data_per_element = header.size_data_per_element;
+    out_size_links_level0 = header.size_links_level0;
+    out_offsetData = header.offsetData;
+    out_offsetLevel0 = header.offsetLevel0;
+    out_data_size = header.data_size;
+
+    // Read data_level0_memory
+    uint64_t mem_size = out_cur_element_count * out_size_data_per_element;
+    if (mem_size > 0) {
+        out_data_level0_memory.resize((size_t)mem_size);
+        ifs.read(out_data_level0_memory.data(), (std::streamsize)mem_size);
+        if (!ifs) return false;
+    }
+
+    // Read entry_points
+    uint8_t buf4[4];
+    out_entry_points.resize((size_t)header.ep_num);
+    for (size_t i = 0; i < header.ep_num; ++i) {
+        ifs.read(reinterpret_cast<char*>(buf4), 4);
+        if (!ifs) return false;
+        out_entry_points[i] = from_le_u32(buf4);
+    }
+
+    // Read logical_to_physical
+    out_logical_to_physical.resize((size_t)out_cur_element_count);
+    for (size_t i = 0; i < out_cur_element_count; ++i) {
+        ifs.read(reinterpret_cast<char*>(buf4), 4);
+        if (!ifs) return false;
+        out_logical_to_physical[i] = from_le_u32(buf4);
+    }
+
+    // Read physical_to_logical
+    out_physical_to_logical.resize((size_t)out_cur_element_count);
+    for (size_t i = 0; i < out_cur_element_count; ++i) {
+        ifs.read(reinterpret_cast<char*>(buf4), 4);
+        if (!ifs) return false;
+        out_physical_to_logical[i] = from_le_u32(buf4);
+    }
+
+    return true;
+}
+
 } // namespace binio
