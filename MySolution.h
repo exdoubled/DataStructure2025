@@ -630,7 +630,6 @@ public:
     size_t maxM_{0};                        // 每个节点第 1 层及以上最大连接数
     size_t maxM0_{0};                       // 每个节点第 0 层最大连接数
     size_t ef_construction_{0};             // 构建时候选列表大小
-    size_t ef_{0};                          // 查询时候选列表大小
 
     double mult_{0.0};                      // 论文中的 m_l
     size_t dim_{0};                         // 数据向量维度
@@ -660,7 +659,6 @@ public:
         size_t M = 16,
         size_t random_seed = 100,
         size_t ef_construction = 200,
-        size_t ef = 200,
         size_t data_size = 0,
         size_t worker_count = 1
     ){
@@ -671,7 +669,6 @@ public:
         maxM0_ = M_ * 2;
         data_size_ = data_size;
         ef_construction_ = max(ef_construction, M_);
-        ef_ = ef;
         level_generator_.seed(random_seed);
         worker_count_ = worker_count;
 
@@ -826,7 +823,7 @@ public:
     4. 对每个邻居，计算距离，若满足条件加入候选集和结果集
     5. 终止条件：候选集最近的点比结果集最远的还远，且结果集已满
     */
-MaxHeap4 searchLayer(
+    MaxHeap4 searchLayer(
         tableint ep_id,
         const float *query,
         int layer,
@@ -1100,57 +1097,6 @@ MaxHeap4 searchLayer(
     }
 
 
-    // 搜索 k 个最近邻，结果直接写入 res 数组
-    void searchKnn(const float *query, size_t k, int* res) const {
-        if (cur_element_count.load(memory_order_acquire) == 0 ||
-            enterpoint_node_.load(memory_order_acquire) == static_cast<tableint>(-1)) {
-            for (size_t i = 0; i < k; ++i) res[i] = -1;
-            return;
-        }
-
-        tableint enterpoint_snapshot = enterpoint_node_.load(memory_order_acquire);
-        tableint currObj = enterpoint_snapshot;
-        dist_t curdist = L2Distance(query, getDataByInternalId(enterpoint_snapshot));
-
-        vector<tableint> neighbors;
-        neighbors.reserve(maxM0_);
-
-        int maxLevelSnapshot = maxlevel_.load(memory_order_acquire);
-        for (int level = maxLevelSnapshot; level > 0; level--) {
-            bool changed = true;
-            while (changed) {
-                changed = false;
-                collectNeighborsLockFree(currObj, level, neighbors);
-                for (tableint cand : neighbors) {
-                    dist_t d = L2Distance(query, getDataByInternalId(cand));
-
-                    if (d < curdist) {
-                        curdist = d;
-                        currObj = cand;
-                        changed = true;
-                    }
-                }
-            }
-        }
-
-        // 查询阶段使用 ef_
-        MaxHeap4 top_candidates = searchLayer(currObj, query, 0, ef_);
-
-        // 使用 partial_sort 取出最小的 k 个
-        size_t result_count = top_candidates.shrink_to_k_smallest(k);
-        
-        // 现在 data_ 已按距离升序排列，直接顺序写入
-        for (size_t i = 0; i < result_count; ++i) {
-            // 将内部物理 ID 映射回逻辑 ID（原始下标）
-            tableint physical_id = top_candidates[i].second;
-            tableint logical_id = (physical_id < physical_to_logical_.size()) ? physical_to_logical_[physical_id] : physical_id;
-            res[i] = static_cast<int>(logical_id);
-        }
-        for (size_t i = result_count; i < k; ++i) {
-            res[i] = -1;
-        }
-    }
-
     void build(int d, const vector<float>& base);
 
     void search(const vector<float>& query, int *res);
@@ -1195,6 +1141,153 @@ private:
 
     mutable atomic<uint64_t> query_distance_calcs_{0};
     mutable atomic<uint64_t> query_count_{0};
+
+    // 搜索 k 个最近邻，结果直接写入 res 数组
+    void searchKNN(const float* query, int* res, float gamma) const {
+        size_t node_count = cur_element_count.load(memory_order_acquire);
+        if (node_count == 0) {
+            return;
+        }
+
+        const size_t k = 10;
+        const float max_gamma = gamma * 1.1f;
+        const float min_gamma = gamma * 0.995f;
+
+        MaxHeap4 top_candidates;
+        MaxHeap4 candidate_set;
+
+        thread_local vector<uint64_t> visit_bitmap_tls;
+        thread_local vector<uint32_t> visit_epoch_tls;
+        thread_local uint32_t visit_token_tls = 1u;
+
+        const size_t needed_words = (max_elements_ + 63ull) >> 6;
+        if (visit_bitmap_tls.size() < needed_words) {
+            visit_bitmap_tls.assign(needed_words, 0ull);
+            visit_epoch_tls.assign(needed_words, 0u);
+        } else if (visit_epoch_tls.size() < visit_bitmap_tls.size()) {
+            visit_epoch_tls.resize(visit_bitmap_tls.size(), 0u);
+        }
+
+        visit_token_tls += 1u;
+        if (visit_token_tls == 0u) {
+            fill(visit_epoch_tls.begin(), visit_epoch_tls.end(), 0u);
+            visit_token_tls = 1u;
+        }
+
+        auto touch_word = [&](size_t word_idx) {
+            if (visit_epoch_tls[word_idx] != visit_token_tls) {
+                visit_epoch_tls[word_idx] = visit_token_tls;
+                visit_bitmap_tls[word_idx] = 0ull;
+            }
+        };
+        auto is_visited = [&](tableint id) -> bool {
+            size_t word = static_cast<size_t>(id) >> 6;
+            size_t bit = static_cast<size_t>(id) & 63ull;
+            touch_word(word);
+            return (visit_bitmap_tls[word] >> bit) & 1ull;
+        };
+        auto mark_visited = [&](tableint id) {
+            size_t word = static_cast<size_t>(id) >> 6;
+            size_t bit = static_cast<size_t>(id) & 63ull;
+            touch_word(word);
+            visit_bitmap_tls[word] |= (1ull << bit);
+        };
+
+        tableint enterpoint_snapshot = enterpoint_node_.load(memory_order_acquire);
+        tableint currObj = enterpoint_snapshot;
+        if (currObj == static_cast<tableint>(-1) || currObj >= node_count) {
+            currObj = 0;
+        }
+
+        dist_t curdist = L2Distance(query, getDataByInternalId(currObj));
+
+        vector<tableint> neighbors;
+        neighbors.reserve(maxM0_);
+
+        int maxLevelSnapshot = maxlevel_.load(memory_order_acquire);
+        for (int level = maxLevelSnapshot; level > 0; level--) {
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                collectNeighborsLockFree(currObj, level, neighbors);
+                for (tableint cand : neighbors) {
+                    dist_t d = L2Distance(query, getDataByInternalId(cand));
+                    if (d < curdist) {
+                        curdist = d;
+                        currObj = cand;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        mark_visited(currObj);
+        candidate_set.emplace(-curdist, currObj);
+        top_candidates.emplace(curdist, currObj);
+
+        const size_t congestion_threshold = k * 6;
+
+        while (!candidate_set.empty()) {
+            float current_gamma = max_gamma;
+            size_t pending_size = candidate_set.size();
+            if (pending_size > congestion_threshold) {
+                float ratio = (float)congestion_threshold / (float)pending_size;
+                current_gamma = max_gamma * ratio;
+                if (current_gamma < min_gamma) current_gamma = min_gamma;
+            }
+
+            auto curr = candidate_set.top();
+            candidate_set.pop();
+
+            dist_t curr_dist = -curr.first;
+
+            if (!top_candidates.empty() && top_candidates.size() >= k) {
+                dist_t worst_best = top_candidates.top().first;
+                if (curr_dist > (1.0f + current_gamma) * worst_best) {
+                    break;
+                }
+            }
+
+            tableint cid = curr.second;
+            linklistsizeint* ll = getLinkListAtLevel(cid, 0);
+            int c_sz = getListCount(ll);
+            tableint* c_ptr = getNeighborsArray(ll);
+
+            if (c_sz > 0) {
+                tableint first = c_ptr[0];
+                _mm_prefetch(reinterpret_cast<const char*>(getDataByInternalId(first)), _MM_HINT_T0);
+            }
+            for (int i = 0; i < c_sz; ++i) {
+                tableint e = c_ptr[i];
+                if (i + 1 < c_sz) {
+                    tableint next = c_ptr[i + 1];
+                    _mm_prefetch(reinterpret_cast<const char*>(getDataByInternalId(next)), _MM_HINT_T0);
+                }
+                if (is_visited(e)) continue;
+                mark_visited(e);
+
+                dist_t d = L2Distance(query, getDataByInternalId(e));
+
+                if (top_candidates.size() < k || d < top_candidates.top().first) {
+                    top_candidates.emplace(d, e);
+                    if (top_candidates.size() > k) {
+                        top_candidates.pop();
+                    }
+                }
+                if (top_candidates.size() < k || d < (1.0f + current_gamma) * top_candidates.top().first) {
+                    candidate_set.emplace(-d, e);
+                }
+            }
+        }
+
+        int curid = static_cast<int>(k);
+        while (!top_candidates.empty() && curid > 0) {
+            tableint physical_id = top_candidates.top().second;
+            tableint logical_id = (physical_id < physical_to_logical_.size()) ? physical_to_logical_[physical_id] : physical_id;
+            res[--curid] = static_cast<int>(logical_id);
+            top_candidates.pop();
+        }
+    }
 
 
     // ====================== 节点重排（BFS） =========================
