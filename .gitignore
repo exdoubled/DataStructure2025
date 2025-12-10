@@ -16,6 +16,7 @@ ans*.txt
 *.exe
 checker
 main
+runner
 
 // 配置文件
 Config.h
@@ -29,3 +30,9 @@ sift/
 // 数据-论文文件
 PJ论文/
 data_o/
+
+// 图缓存文件
+graph_cache
+
+// 实验结果
+experiment_results.csv

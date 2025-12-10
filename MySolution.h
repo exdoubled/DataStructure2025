@@ -53,6 +53,39 @@ struct DistanceStatContext {
     inline static thread_local uint64_t counter = 0;
 };
 
+// ==================== Ablation Study Configuration ====================
+
+// Search method enum
+enum class SearchMethod {
+    ADAPTIVE_GAMMA,  // Current adaptive gamma search (searchKNN)
+    FIXED_EF         // Standard HNSW fixed ef search
+};
+
+// Configuration struct for ablation study
+struct SolutionConfig {
+    // Build parameters
+    size_t M = 96;                    // Maximum connections per node at level 0
+    size_t ef_construction = 400;     // Construction ef parameter
+    bool enable_onng = true;          // Enable ONNG graph optimization
+    size_t onng_out_degree = 96;      // ONNG output degree (e_o)
+    size_t onng_in_degree = 144;      // ONNG input degree (e_i)
+    size_t onng_min_edges = 64;       // ONNG minimum edges
+    bool enable_bfs = true;           // Enable BFS memory reordering
+    bool enable_simd = true;          // Enable SIMD (false = force scalar)
+    
+    // Search parameters
+    SearchMethod search_method = SearchMethod::ADAPTIVE_GAMMA;
+    float gamma = 0.19f;              // Gamma for adaptive search
+    size_t ef_search = 704;           // EF for fixed ef search
+    size_t k = 10;                    // Top-K results
+    
+    // Debug/profiling parameters
+    bool count_distance_computation = false;  // If true, count distance computations (slower)
+    
+    // Entry point parameters
+    size_t ep_num = 100;              // Number of entry points
+    size_t random_seed = 114514;      // Random seed for reproducibility
+};
 
 // HNSW
 typedef unsigned int tableint;   // unsigned 和 float 都是 4 字节 
@@ -242,9 +275,22 @@ inline dist_t compute(const float* a, const float* b, size_t dim) {
     return kernel(a, b, dim);
 }
 
+// Runtime-switchable compute: use SIMD or scalar based on flag
+inline dist_t compute_switchable(const float* a, const float* b, size_t dim, bool use_simd) {
+    if (use_simd) {
+        static const L2Kernel kernel = init_kernel();
+        return kernel(a, b, dim);
+    }
+    return l2_distance_scalar(a, b, dim);
+}
+
 #else // !SOLUTION_PLATFORM_X86
 
 inline dist_t compute(const float* a, const float* b, size_t dim) {
+    return l2_distance_scalar(a, b, dim);
+}
+
+inline dist_t compute_switchable(const float* a, const float* b, size_t dim, bool /*use_simd*/) {
     return l2_distance_scalar(a, b, dim);
 }
 
@@ -359,6 +405,24 @@ public:
 
 class Solution {
 public:
+    // ====================== Configuration =========================
+    SolutionConfig config_;
+    
+    // Set configuration (should be called before build)
+    void setConfig(const SolutionConfig& cfg) {
+        config_ = cfg;
+        ep_num_ = cfg.ep_num;
+    }
+    
+    // Get current configuration
+    const SolutionConfig& getConfig() const { return config_; }
+    
+    // Reset distance computation statistics
+    void resetDistanceStats() {
+        query_distance_calcs_.store(0, memory_order_relaxed);
+        query_count_.store(0, memory_order_relaxed);
+    }
+    
     // ====================== 随机选取入口点  =========================
     void initRandomEpoints() {
         entry_points_.clear();
@@ -690,14 +754,12 @@ public:
         out.assign(data, data + size);
     }
 
-    // 欧式距离
+    // 欧式距离 (with config-based SIMD toggle and optional distance counting)
     dist_t L2Distance(const float * a, const float * b) const {
-        /*
-        if (DistanceStatContext::active_solution == this) {
-            DistanceStatContext::counter++;
+        if (config_.count_distance_computation) {
+            query_distance_calcs_.fetch_add(1, memory_order_relaxed);
         }
-        */
-        return simd_detail::compute(a, b, dim_);
+        return simd_detail::compute_switchable(a, b, dim_, config_.enable_simd);
     }
 
     // 在指定层搜索，返回至多 ef_limit 个近邻节点
@@ -908,8 +970,14 @@ public:
 
 
     void build(int d, const vector<float>& base);
+    
+    // Build with explicit config (for ablation study)
+    void buildWithConfig(int d, const vector<float>& base, const SolutionConfig& cfg);
 
     void search(const vector<float>& query, int *res);
+    
+    // Search with explicit k parameter (for ablation study)
+    void searchWithK(const vector<float>& query, int *res, size_t k);
 
     // ====================== 图结构缓存 I/O =========================
     // 保存图结构到二进制文件
@@ -1048,6 +1116,8 @@ public:
         return true;
     }
 
+    // Get average distance computations per search
+    // Note: Only meaningful if config_.count_distance_computation was true during search
     double getAverageDistanceCalcsPerSearch() const {
         uint64_t searches = query_count_.load(memory_order_relaxed);
         if (searches == 0) {
@@ -1055,6 +1125,21 @@ public:
         }
         uint64_t total = query_distance_calcs_.load(memory_order_relaxed);
         return static_cast<double>(total) / static_cast<double>(searches);
+    }
+    
+    // Get total distance computations (useful for ablation)
+    uint64_t getTotalDistanceCalcs() const {
+        return query_distance_calcs_.load(memory_order_relaxed);
+    }
+    
+    // Get total query count
+    uint64_t getQueryCount() const {
+        return query_count_.load(memory_order_relaxed);
+    }
+    
+    // Increment query count (called per search for stats tracking)
+    void incrementQueryCount() const {
+        query_count_.fetch_add(1, memory_order_relaxed);
     }
 
 private:
@@ -1222,6 +1307,47 @@ private:
         }
     }
 
+
+    // Fixed EF search: Standard HNSW search with fixed ef parameter
+    void searchKNN_FixedEF(const float* query, int* res, size_t k, size_t ef) const {
+        size_t node_count = cur_element_count.load(memory_order_acquire);
+        if (node_count == 0) {
+            for (size_t i = 0; i < k; ++i) res[i] = -1;
+            return;
+        }
+
+        // Find best entry point from multiple entry points
+        dist_t curBest = numeric_limits<dist_t>::max();
+        tableint start_ep = 0;
+        
+        for (tableint ep : entry_points_) {
+            dist_t d = L2Distance(query, getDataByInternalId(ep));
+            if (d < curBest) {
+                curBest = d;
+                start_ep = ep;
+            }
+        }
+        
+        // Use searchLayer with fixed ef
+        MaxHeap4 top_candidates = searchLayer(start_ep, query, ef);
+        
+        // Shrink to k smallest
+        size_t result_count = top_candidates.shrink_to_k_smallest(k);
+        
+        // Write results mapping physical_id -> logical_id
+        for (size_t i = 0; i < result_count; ++i) {
+            tableint physical_id = top_candidates[i].second;
+            tableint logical_id = (physical_id < physical_to_logical_.size()) 
+                                  ? physical_to_logical_[physical_id] 
+                                  : physical_id;
+            res[i] = static_cast<int>(logical_id);
+        }
+        
+        // Fill remaining with -1
+        for (size_t i = result_count; i < k; ++i) {
+            res[i] = -1;
+        }
+    }
 
     // ====================== 节点重排（BFS） =========================
     // 以提升访问局部性
