@@ -43,8 +43,6 @@
 #include "Brute.h"
 #include "BinaryIO.h"
 
-#include "hnswlib/hnswlib.h"
-
 // 见 Config.h
 // ---- Runtime knobs (easy to tweak) ----
 // 是否打印进度（1 打印 / 0 不打印）
@@ -443,7 +441,7 @@ int main(int argc, char** argv) {
     int dataset_case = 0;
     std::string ans_path = ANSFILEPATH;
     size_t firstN = 0; // 0 = evaluate all
-    std::string algo = "solution"; // solution | brute | hnsw
+    std::string algo = "solution"; // solution | brute
     std::string query_override;     // optional custom query file path
     bool save_bin_base = false;
     
@@ -673,43 +671,7 @@ int main(int argc, char** argv) {
         search_ms = std::chrono::duration<double>(t1 - t0).count() * 1000.0;
         avg_distance_calcs = sol.getAverageDistanceCalcsPerSearch();
         has_distance_stats = true;
-    } else if (algo == "hnsw") {
-        // 使用 hnswlib 进行 ANN 搜索，参考根目录 cpp/example 的调用模式
-        hnswlib::L2Space space(dim);
-        const size_t max_elements = base_data.size() / (size_t)dim; // 与已加载的 base 数据一致
-
-        auto t_build_start = std::chrono::high_resolution_clock::now();
-        hnswlib::HierarchicalNSW<float> alg_hnsw(&space, max_elements, 16, 200, 42);
-        for (size_t i = 0; i < max_elements; ++i) {
-            alg_hnsw.addPoint(base_data.data() + i * dim, (hnswlib::labeltype)i);
-        }
-        // 提高 ef 以提升 recall（示例中常用 100~200）
-        alg_hnsw.setEf(200);
-        auto t_build_end = std::chrono::high_resolution_clock::now();
-
-        auto t0 = std::chrono::high_resolution_clock::now();
-        for (size_t qi = 0; qi < num_to_eval; ++qi) {
-            auto result_queue = alg_hnsw.searchKnn(queries[qi].data(), pred_k);
-            // priority_queue 顶端为最大距离，弹出收集后反转得到从近到远
-            std::vector<int> tmp;
-            tmp.reserve(pred_k);
-            while (!result_queue.empty()) {
-                tmp.push_back((int)result_queue.top().second);
-                result_queue.pop();
-            }
-            std::reverse(tmp.begin(), tmp.end());
-            for (size_t j = 0; j < tmp.size() && j < (size_t)pred_k; ++j) {
-                pred[qi][j] = tmp[j];
-            }
-            if (ENABLE_PROGRESS && ((qi + 1) % PROGRESS_STEP_SEARCH == 0 || qi + 1 == num_to_eval))
-                progress_bar("Searching", qi + 1, num_to_eval, t0);
-        }
-        auto t1 = std::chrono::high_resolution_clock::now();
-
-        build_ms = std::chrono::duration<double>(t_build_end - t_build_start).count() * 1000.0;
-        search_ms = std::chrono::duration<double>(t1 - t0).count() * 1000.0;
-    }
-    else { // brute
+    } else { // brute
         BSolution sol;
         auto t_build_start = std::chrono::high_resolution_clock::now();
         sol.build(dim, base_data);

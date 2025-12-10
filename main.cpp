@@ -31,8 +31,6 @@
 #include "Config.h"
 #include "BinaryIO.h"
 
-#include "hnswlib/hnswlib.h"
-
 // ---- Runtime knobs (easy to tweak) ----
 // 是否打印进度（1 打印 / 0 不打印）
 #define PRINT_PROGRESS 1
@@ -720,41 +718,7 @@ int main(int argc, char** argv) {
         }
         auto end2 = std::chrono::high_resolution_clock::now();
         search_duration = end2 - start2;
-    } else if(algo == "hnsw"){
-        hnswlib::L2Space l2space(dim);
-        const size_t max_elements = N;
-
-        auto start1 = std::chrono::high_resolution_clock::now();
-        hnswlib::HierarchicalNSW<float> appr_alg(&l2space, max_elements, 16, 200, 42);
-        for(size_t i = 0; i < N; i++) {
-            appr_alg.addPoint((void*)&base_data[i * dim], (size_t)i);
-            if (ENABLE_PROGRESS && ((i + 1) % PROGRESS_STEP_LOAD == 0 || i + 1 == N))
-                progress_bar("Building HNSW", i + 1, N, start1);
-        }
-        appr_alg.setEf(200);
-        auto end1 = std::chrono::high_resolution_clock::now();
-        build_duration = end1 - start1;
-        if (ENABLE_PROGRESS) std::cerr << "[Progress] Build done in " 
-                                       << std::chrono::duration<double>(build_duration).count() << "s\n";
-        // Search
-        auto start2 = std::chrono::high_resolution_clock::now();
-        for (int i = 0; i < processed_queries; ++i) {
-            auto pq = appr_alg.searchKnn((void*)query_data[i].data(), k);
-            std::vector<int> tmp; tmp.reserve(k);
-            while (!pq.empty()) {
-                tmp.push_back((int)pq.top().second);
-                pq.pop();
-            }
-            std::reverse(tmp.begin(), tmp.end());
-            for (int j = 0; j < k && j < (int)tmp.size(); ++j) result[i][j] = tmp[j];
-
-            if (ENABLE_PROGRESS && ((i + 1) % PROGRESS_STEP_SEARCH == 0 || i + 1 == processed_queries))
-                progress_bar("Searching HNSW", i + 1, processed_queries, start2);
-        }
-        auto end2 = std::chrono::high_resolution_clock::now();
-        search_duration = end2 - start2;
-    } 
-    else { // brute
+    } else { // brute
         // Build
         auto start1 = std::chrono::high_resolution_clock::now();
         bsolution.build(dim, base_data);
