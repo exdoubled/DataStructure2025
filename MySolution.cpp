@@ -13,14 +13,14 @@ void Solution::build(int d, const vector<float>& base) {
     size_t worker_count = min(std::thread::hardware_concurrency(), 32u); // 多线程线程数
 
     // ==================== HNSW 初始化 ====================
-    // 分别代表：max_elements, M, random_seed, ef_construction, ef, data_size, worker_count
-    initHNSW(n, 48, 114514, 400, data_size_, worker_count); 
+    // 分别代表：max_elements, maxM0, random_seed, ef_construction, data_size, worker_count
+    initHNSW(n, 96, 114514, 400, data_size_, worker_count); 
 
     // 单线程插入
     if (worker_count_ == 1) {
         for (size_t i = 0; i < n; ++i) {
             const float* vec = &base[i * dim_];
-            insert(vec, -1);
+            insert(vec);
         }
         return;
     }
@@ -32,7 +32,7 @@ void Solution::build(int d, const vector<float>& base) {
             size_t idx = next_index.fetch_add(1, std::memory_order_relaxed);
             if (idx >= n) break;
             const float* vec = &base[idx * dim_];
-            insert(vec, -1);
+            insert(vec);
         }
     };
 
@@ -46,7 +46,9 @@ void Solution::build(int d, const vector<float>& base) {
     }
 
     // ==================== ONNG 优化 ====================
-    optimizeGraphDirectly(false, 96, 144, 64);  // e_o=64, e_i=84, min=48
+    constructAdjustedGraph(96, 144, 64);
+
+    initRandomEpoints();
     reorderNodesByBFS();
 
     

@@ -357,19 +357,30 @@ public:
 
 class Solution {
 public:
-    // ====================== ONNG 优化  =========================
+    // ====================== 随机选取入口点  =========================
+    void initRandomEpoints() {
+        entry_points_.clear();
+        size_t node_count = cur_element_count.load(std::memory_order_acquire);
+        if (node_count > 0) {
+            size_t epNum = min(ep_num_, node_count);
+            vector<tableint> ids(node_count);
+            for (tableint i = 0; i < static_cast<tableint>(node_count); ++i) ids[i] = i;
+            shuffle(ids.begin(), ids.end(), ep_random_);
+            entry_points_.assign(ids.begin(), ids.begin() + epNum);
+        }
+    }
     
+    // ====================== ONNG 优化  =========================
     // Algorithm 4: AdjustPath - 剪枝冗余边
-    // 返回剪枝后的邻接表
-    vector<vector<tableint>> adjustPath(int layer, size_t minNoOfEdges) {
+    // 返回剪枝后的邻接表（仅作用于第 0 层图）
+    vector<vector<tableint>> adjustPath(size_t minNoOfEdges) {
         size_t node_count = cur_element_count.load(memory_order_acquire);
         vector<vector<tableint>> G_p(node_count);  // 剪枝后的图
         
         // 每个节点建立邻居 HashSet
         vector<unordered_set<tableint>> neighborSets(node_count);
         for (tableint n = 0; n < static_cast<tableint>(node_count); ++n) {
-            if (layer > element_levels_[n]) continue;
-            linklistsizeint* ll = getLinkListAtLevel(n, layer);
+            linklistsizeint* ll = getLinkListAtLevel(n);
             int size = getListCount(ll);
             const tableint* neighbors = getNeighborsArray(ll);
             neighborSets[n].reserve(size);
@@ -380,9 +391,7 @@ public:
         
         // 遍历每个节点的邻居，检查替代路径
         for (tableint src = 0; src < static_cast<tableint>(node_count); ++src) {
-            if (layer > element_levels_[src]) continue;
-            
-            linklistsizeint* ll = getLinkListAtLevel(src, layer);
+            linklistsizeint* ll = getLinkListAtLevel(src);
             int size = getListCount(ll);
             const tableint* neighbors = getNeighborsArray(ll);
             const float* src_data = getDataByInternalId(src);
@@ -429,12 +438,12 @@ public:
     // Algorithm 3: ConstructAdjustedGraphWithConstraint
     // 从剪枝后的图重构，同时添加反向边并控制入度
     // e_o: 出度上限, e_i: 入度上限, minEdges: adjustPath 最小边数
-    void constructAdjustedGraph(int layer, size_t e_o, size_t e_i, size_t minEdges = 0) {
+    void constructAdjustedGraph(size_t e_o, size_t e_i, size_t minEdges = 0) {
         size_t node_count = cur_element_count.load(memory_order_acquire);
         if (minEdges == 0) minEdges = e_o;
         
         // 调用 Algorithm 4 得到剪枝后的图 G_t
-        vector<vector<tableint>> G_t = adjustPath(layer, minEdges);
+        vector<vector<tableint>> G_t = adjustPath(minEdges);
         
         // 收集反向边
         vector<vector<distPair>> reverseEdges(node_count);
@@ -450,11 +459,10 @@ public:
         vector<vector<tableint>> G_e(node_count);
         vector<size_t> indegree(node_count, 0);
         
-        // 按出度排序，优先处理出度小的节点
+        // 按出度排序，优先处理出度小的节点（仅第 0 层）
         vector<pair<size_t, tableint>> sortedByOutdegree;
         sortedByOutdegree.reserve(node_count);
         for (tableint o = 0; o < static_cast<tableint>(node_count); ++o) {
-            if (layer > element_levels_[o]) continue;
             sortedByOutdegree.emplace_back(G_t[o].size(), o);
         }
         sort(sortedByOutdegree.begin(), sortedByOutdegree.end());
@@ -506,10 +514,9 @@ public:
         
         // 如果不足，从原图补充
         for (tableint o = 0; o < static_cast<tableint>(node_count); ++o) {
-            if (layer > element_levels_[o]) continue;
             if (G_e[o].size() >= e_o) continue;
             
-            linklistsizeint* ll = getLinkListAtLevel(o, layer);
+            linklistsizeint* ll = getLinkListAtLevel(o);
             int size = getListCount(ll);
             const tableint* neighbors = getNeighborsArray(ll);
             const float* o_data = getDataByInternalId(o);
@@ -534,13 +541,11 @@ public:
         
         // 写回 HNSW 图结构
         for (tableint o = 0; o < static_cast<tableint>(node_count); ++o) {
-            if (layer > element_levels_[o]) continue;
-            
             lock_guard<mutex> lock(link_list_locks_[o]);
-            linklistsizeint* ll = getLinkListAtLevel(o, layer);
+            linklistsizeint* ll = getLinkListAtLevel(o);
             tableint* arr = getNeighborsArray(ll);
             
-            size_t cnt = min(G_e[o].size(), (layer == 0) ? maxM0_ : maxM_);
+            size_t cnt = min(G_e[o].size(), maxM0_);
             for (size_t i = 0; i < cnt; ++i) {
                 arr[i] = G_e[o][i];
             }
@@ -548,105 +553,35 @@ public:
         }
     }
     
-    // 统一优化接口
-    // e_o: 出度上限
-    // e_i: 入度上限
-    // minEdges: adjustPath 的最小边数
-    void optimizeGraphDirectly(bool optimize_high_layers = false, 
-                                size_t e_o = 0,
-                                size_t e_i = 0, 
-                                size_t minEdges = 0,
-                                int maxOnngLevel = 0) {
-
-        int max_level = maxlevel_.load(memory_order_acquire);
-        maxOnngLevel = (maxOnngLevel <= 0) ? max_level : maxOnngLevel;
-
-        // ============ 强制中心化入口 ============
-        // 计算所有点的几何质心，并选择离质心最近的点作为新的 enterpoint
-        size_t node_count = cur_element_count.load(memory_order_acquire);
-        if (node_count > 0 && dim_ > 0) {
-            vector<float> centroid(dim_, 0.0f);
-            for (tableint id = 0; id < static_cast<tableint>(node_count); ++id) {
-                const float* v = getDataByInternalId(id);
-                for (size_t d = 0; d < dim_; ++d) centroid[d] += v[d];
-            }
-            float inv_n = 1.0f / static_cast<float>(node_count);
-            for (size_t d = 0; d < dim_; ++d) centroid[d] *= inv_n;
-
-            tableint best_id = 0;
-            dist_t best_dist = numeric_limits<dist_t>::max();
-            for (tableint id = 0; id < static_cast<tableint>(node_count); ++id) {
-                dist_t d = L2Distance(centroid.data(), getDataByInternalId(id));
-                if (d < best_dist) {
-                    best_dist = d;
-                    best_id = id;
-                }
-            }
-            enterpoint_node_.store(best_id, memory_order_release);
-        }
-
-        size_t e_o_l0 = e_o;
-        size_t e_i_l0 = e_i;
-        size_t min_l0 = minEdges / 10 * 9;
-        
-        // 第0层优化
-        constructAdjustedGraph(0, e_o_l0, e_i_l0, min_l0);
-        
-        if (optimize_high_layers && max_level > 0) {
-            // 高层优化
-            size_t e_o_h = min(e_o, maxM_);
-            size_t e_i_h = min(e_i, maxM_);
-            size_t min_h = minEdges / 10 * 12;
-            
-            for (int level = 1; level <= min(max_level, maxOnngLevel); ++level) {
-                constructAdjustedGraph(level, e_o_h, e_i_h, min_h);
-            }
-        }
-    }
     
     
     // ==================== HNSW 结构 ====================
 
-    // 图结构
-    // 储存节点数据及第 0 层的邻居关系
-    // 邻居数量，flag, 凑对齐，邻居节点 id，数据向量，标签
-    // 对每一个 Node: size->reserved->neighbors
-    // size:2 bytes, reserved:2 byte
-
+    // 图结构：仅保留第 0 层邻接 + 向量数据
+    // 对每一个 Node: size->reserved->neighbors(第0层) + 向量数据
     char* data_level0_memory_{nullptr};
-    
-    // 二维数组，每一行代表一个节点从第 1 层到最高层的邻居关系
-    // 邻居数量，凑对齐，邻居节点 id
-    // 每一层存储格式：size->reserved->neighbors
-    // size:2 bytes, reserved:2 bytes
-    
-    char** linkLists_{nullptr};
-
-    vector<int> element_levels_; // 记录每个节点的层数
     mutable unique_ptr<mutex[]> link_list_locks_; // 每个节点的邻接锁，支持并发构建
 
     size_t max_elements_{0};                // 最大节点数量
-    size_t M_{0};                           // 每个节点最大连接数
-    size_t maxM_{0};                        // 每个节点第 1 层及以上最大连接数
     size_t maxM0_{0};                       // 每个节点第 0 层最大连接数
     size_t ef_construction_{0};             // 构建时候选列表大小
 
-    double mult_{0.0};                      // 论文中的 m_l
     size_t dim_{0};                         // 数据向量维度
 
     size_t data_size_{0};                   // 数据向量大小
     size_t size_links_level0_{0};           // 第 0 层每个节点链接大小
     size_t size_data_per_element_{0};       // 每个节点数据大小
-    size_t size_links_per_element_{0};      // 每个节点第 1 层及以上链接大小
     size_t offsetData_{0}, offsetLevel0_{0};// 偏移量
 
-    atomic<tableint> enterpoint_node_{static_cast<tableint>(-1)};  // 并行构建时的入口点
-    atomic<int> maxlevel_{-1};              // 并行构建时当前最大层数
-    atomic<bool> has_enterpoint_{false};    // 并行构建时是否已有入口点
+    atomic<tableint> enterpoint_node_{static_cast<tableint>(-1)};  // 可选：用于 BFS 重排等
     atomic<size_t> cur_element_count{0};    // 当前节点数量
-    size_t worker_count_{0};                     // 构建时的工作线程数
+    size_t worker_count_{0};                // 构建时的工作线程数
 
-    default_random_engine level_generator_; // 用于生成随机层数的随机数
+    default_random_engine ep_random_; // 用于随机选取入口点
+
+    // 多入口点：在全部插入结束后随机选取 ep_num_ 个节点作为入口
+    size_t ep_num_{100};
+    vector<tableint> entry_points_;
 
     // 逻辑 ID (原始下标) 与物理 ID (内部存储下标) 映射
     // 构建时：logical_id = 插入顺序/原始下标；physical_id = 内部数组下标
@@ -664,16 +599,11 @@ public:
     ){
         // 设置参数
         max_elements_ = max_elements;
-        M_ = M;
-        maxM_ = M_;
-        maxM0_ = M_ * 2;
+        maxM0_ = M;
         data_size_ = data_size;
-        ef_construction_ = max(ef_construction, M_);
-        level_generator_.seed(random_seed);
+        ef_construction_ = ef_construction;
         worker_count_ = worker_count;
-
-        // 计算 mult
-        mult_ = 1 / log(1.0 * M_);
+        ep_random_.seed(random_seed);
 
         // 初始化当前节点数量
         cur_element_count.store(0, memory_order_relaxed);
@@ -683,14 +613,9 @@ public:
         offsetLevel0_ = 0;
         offsetData_ = offsetLevel0_ + size_links_level0_;
         size_data_per_element_ = size_links_level0_ + data_size_;
-        size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
 
-        // 分配内存
+        // 分配内存（0 层邻接 + 向量数据）
         data_level0_memory_ = (char *) malloc(max_elements_ * size_data_per_element_);
-        linkLists_ = (char **) malloc(sizeof(void *) * max_elements_);
-        
-        // 层数记录
-        element_levels_.assign(max_elements_, 0);
 
         // ID 映射表
         logical_to_physical_.assign(max_elements_, static_cast<tableint>(-1));
@@ -701,24 +626,13 @@ public:
 
         // 初始化入口点相关变量
         enterpoint_node_.store(static_cast<tableint>(-1), memory_order_relaxed);
-        maxlevel_.store(-1, memory_order_relaxed);
-        has_enterpoint_.store(false, memory_order_relaxed);
     }
 
     void clear() {
         free(data_level0_memory_);
         data_level0_memory_ = nullptr;
-        tableint existing = static_cast<tableint>(cur_element_count.load(memory_order_relaxed));
-        for (tableint i = 0; i < existing; i++) {
-            if (element_levels_[i] > 0)
-                free(linkLists_[i]);
-        }
-        free(linkLists_);
-        linkLists_ = nullptr;
         cur_element_count.store(0, memory_order_relaxed);
         enterpoint_node_.store(static_cast<tableint>(-1), memory_order_relaxed);
-        maxlevel_.store(-1, memory_order_relaxed);
-        has_enterpoint_.store(false, memory_order_relaxed);
         link_list_locks_.reset();
 
         logical_to_physical_.clear();
@@ -732,19 +646,9 @@ public:
         return reinterpret_cast<const float*>(data_level0_memory_ + id * size_data_per_element_ + offsetData_);
     }
 
-    // 获取第 0 层的邻居列表指针，不直接使用，需通过 getLinkListAtLevel 调用
-    linklistsizeint *get_linklist0(tableint id) const {
-    return (linklistsizeint *) (data_level0_memory_ + id * size_data_per_element_ + offsetLevel0_);
-    }
-
-    // 获取第 1 层及以上的邻居列表指针，不直接使用，需通过 getLinkListAtLevel 调用
-    linklistsizeint *get_linklist(tableint id, int level) const {
-        return (linklistsizeint *) (linkLists_[id] + (level - 1) * size_links_per_element_);
-    }
-
     // 获取指定层的邻居列表指针
-    linklistsizeint *getLinkListAtLevel(tableint id, int level) const {
-        return level == 0 ? get_linklist0(id) : get_linklist(id, level);
+    linklistsizeint *getLinkListAtLevel(tableint id) const {
+        return (linklistsizeint *) (data_level0_memory_ + id * size_data_per_element_ + offsetLevel0_);
     }
 
     // 获取目前 ListCount 即邻居
@@ -764,29 +668,21 @@ public:
 
 
     // 使用锁保护，确保并发插入时的线程安全（build 阶段使用）
-    void collectNeighbors(tableint id, int level, vector<tableint>& out) const {
+    void collectNeighbors(tableint id, vector<tableint>& out) const {
         if (!link_list_locks_ || id >= max_elements_) {
             out.clear();
             return;
         }
         lock_guard<mutex> guard(link_list_locks_[id]);
-        if (level > element_levels_[id]) {
-            out.clear();
-            return;
-        }
-        linklistsizeint *header = getLinkListAtLevel(id, level);
+        linklistsizeint *header = getLinkListAtLevel(id);
         int size = getListCount(header);
         tableint *data = getNeighborsArray(header);
         out.assign(data, data + size);
     }
 
     // 无锁版本，用于 search 阶段（只读，build 完成后调用）
-    inline void collectNeighborsLockFree(tableint id, int level, vector<tableint>& out) const {
-        if (level > element_levels_[id]) {
-            out.clear();
-            return;
-        }
-        linklistsizeint *header = getLinkListAtLevel(id, level);
+    inline void collectNeighborsLockFree(tableint id, vector<tableint>& out) const {
+        linklistsizeint *header = getLinkListAtLevel(id);
         int size = getListCount(header);
         tableint *data = getNeighborsArray(header);
         out.assign(data, data + size);
@@ -802,18 +698,6 @@ public:
         return simd_detail::compute(a, b, dim_);
     }
 
-    // 产生指数分布的层数
-    int generateRandomLevel(double reverse_size){
-        
-        uniform_real_distribution<float> distribution(0.0f, 1.0f);
-        float r = distribution(level_generator_);
-        // 避免 r=0 导致 -log(0) 造成层数极大并引发巨额分配
-        r = min(0.999999f, max(r, 1e-6f));
-        double level = -log(r) * reverse_size;
-        return (int)level;
-       // return 0;
-    }
-
     // 在指定层搜索，返回至多 ef_limit 个近邻节点
     // 实现论文的 Algorithm 2
     /*
@@ -826,7 +710,6 @@ public:
     MaxHeap4 searchLayer(
         tableint ep_id,
         const float *query,
-        int layer,
         size_t ef_limit) const {
         MaxHeap4 top_candidates;  // 最大堆，堆顶是最大距离
         MaxHeap4 candidate_set;   // 也用最大堆，存负距离模拟最小堆
@@ -884,7 +767,7 @@ public:
             candidate_set.pop();
             tableint curID = currPair.second;
 
-            linklistsizeint* ll = getLinkListAtLevel(curID, layer);
+            linklistsizeint* ll = getLinkListAtLevel(curID);
             int size = getListCount(ll);
             const tableint* data = getNeighborsArray(ll);
             for (int i = 0; i < size; ++i) {
@@ -936,10 +819,11 @@ public:
         for (const auto& p : selected) topCandidates.emplace(p.first, p.second);
     }
 
-    // 将新节点和已有节点互相连接
+    // 将新节点和已有节点互相连接（仅第 0 层）
     tableint mutuallyConnectNewElement(tableint cur_c, MaxHeap4& top_candidates, int level) {
-        size_t Mcurmax = level ? maxM_ : maxM0_;
-        selectNeighborsHeuristic(top_candidates, M_);
+        (void)level;
+        size_t Mcurmax = maxM0_;
+        selectNeighborsHeuristic(top_candidates, maxM0_);
         
         size_t neighbor_cnt = top_candidates.size();
         tableint next_close_ep = top_candidates[neighbor_cnt - 1].second;
@@ -947,7 +831,7 @@ public:
         // 新节点写入本层的邻接
         {
             lock_guard<mutex> lock(link_list_locks_[cur_c]);
-            linklistsizeint* ll = getLinkListAtLevel(cur_c, level);
+            linklistsizeint* ll = getLinkListAtLevel(cur_c);
             tableint* arr = getNeighborsArray(ll);
             size_t cnt = min(neighbor_cnt, Mcurmax);
             for (size_t i = 0; i < cnt; ++i) arr[i] = top_candidates[i].second;
@@ -959,7 +843,7 @@ public:
             tableint nbr = top_candidates[i].second;
             lock_guard<mutex> lock(link_list_locks_[nbr]);
             
-            linklistsizeint* ll = getLinkListAtLevel(nbr, level);
+            linklistsizeint* ll = getLinkListAtLevel(nbr);
             size_t sz = getListCount(ll);
             tableint* arr = getNeighborsArray(ll);
 
@@ -983,117 +867,41 @@ public:
     }
 
 
-    // 把数据插入到多层图中
+    // 插入新节点到单层图中
     // 并发插入：通过原子 ID 分配 + per-node 邻接锁，确保多个线程可以安全地同时写入图结构。
-    /*
-    1. 分配节点 ID cur_c
-    2. 随机生成层数 curlevel
-    3. 写入节点数据和初始化邻接列表
-    4. 如果是第一个节点，设置为入口点并返回
-    5. 贪心下降找到插入层 curlevel
-    6. 从 curlevel 层开始，逐层向下插入节点并连接邻居 searchLayer + mutuallyConnect
-    7. 如果 curlevel > 当前最大层数，更新入口点和最大层数
-    */
-    void insert(const float *vec, int level) {
+    void insert(const float *vec) {
         tableint cur_c = cur_element_count.fetch_add(1, memory_order_acq_rel);
-        if (cur_c >= max_elements_)
-            throw runtime_error("HNSW capacity exceeded");
 
         tableint logical_id = cur_c;
         tableint physical_id = cur_c;
         logical_to_physical_[logical_id] = physical_id;
         physical_to_logical_[physical_id] = logical_id;
 
-        bool is_first = (cur_c == 0);
-
-        // 随机初始化层数
-        int curlevel = generateRandomLevel(mult_);
-        if(level > 0) curlevel = level;
-
-        element_levels_[physical_id] = curlevel;
-        tableint currObj = enterpoint_node_.load(memory_order_acquire);
-        tableint enterpoint_copy = currObj;
-
-
         char* base_ptr = data_level0_memory_ + physical_id * size_data_per_element_;
 
         // 写入向量数据
         memcpy(base_ptr + offsetData_, vec, data_size_);
 
-        // 初始化 level0 链表头与槽
+        // 初始化第 0 层邻接表
         linklistsizeint* ll_head = reinterpret_cast<linklistsizeint*>(base_ptr + offsetLevel0_);
         *reinterpret_cast<unsigned short*>(ll_head) = 0;
         tableint* ll_array = reinterpret_cast<tableint*>((char*)ll_head + sizeof(unsigned short));
         memset(ll_array, 0, maxM0_ * sizeof(tableint));
 
-        // 高层链表（仅在 curlevel>0 分配并清零）
-        if (curlevel > 0) {
-            size_t bytes = size_links_per_element_ * curlevel;
-            linkLists_[cur_c] = (char*)malloc(bytes);
-            memset(linkLists_[cur_c], 0, bytes);
-        }
-
-        if (is_first) {
+        // 第一个点直接作为构建阶段的入口点
+        if (cur_c == 0) {
             enterpoint_node_.store(physical_id, memory_order_release);
-            maxlevel_.store(curlevel, memory_order_release);
-            has_enterpoint_.store(true, memory_order_release);
             return;
         }
 
-        while (!has_enterpoint_.load(memory_order_acquire)) {
-            this_thread::yield();
+        // 其余点：从当前入口点出发在第 0 层搜索候选邻居
+        tableint currObj = enterpoint_node_.load(memory_order_acquire);
+        if (currObj == static_cast<tableint>(-1) || currObj >= cur_c) {
+            currObj = 0;
         }
 
-        currObj = enterpoint_node_.load(memory_order_acquire);
-        enterpoint_copy = currObj;
-        int maxLevelSnapshot = maxlevel_.load(memory_order_acquire);
-
-        if (currObj != static_cast<tableint>(-1)) {
-            if(curlevel < maxLevelSnapshot) {
-                dist_t curdist = L2Distance(vec, getDataByInternalId(currObj));
-                vector<tableint> neighbors;
-                neighbors.reserve(maxM0_);
-                for(int level = maxLevelSnapshot; level > curlevel; level--) {
-                    bool changed = true;
-                    while(changed) {
-                        changed = false;
-                        collectNeighbors(currObj, level, neighbors);
-                        for(tableint neighbor : neighbors) {
-                            dist_t d = L2Distance(vec, getDataByInternalId(neighbor));
-                            if(d < curdist) {
-                                curdist = d;
-                                currObj = neighbor;
-                                changed = true;
-                            }
-                        }
-                    }
-                }
-
-                // 从 curlevel 往下，找到一定数量的邻居，这里设定是 M_
-                for (int lvl = min(curlevel, maxLevelSnapshot); lvl >= 0; lvl--) {
-                    auto top_candidates = searchLayer(currObj, vec, lvl, ef_construction_);
-                    // 这里把 Algorithm 1 后面的部分 合并到连接邻居一起实现了
-                    currObj = mutuallyConnectNewElement(physical_id, top_candidates, lvl);
-                }
-            } else {
-                tableint ep = enterpoint_copy;
-                for (int lvl = maxLevelSnapshot; lvl >= 0; --lvl) {
-                    auto top_candidates = searchLayer(ep, vec, lvl, ef_construction_);
-                    ep = mutuallyConnectNewElement(physical_id, top_candidates, lvl);
-                }
-                bool updated = false;
-                int expected = maxLevelSnapshot;
-                while (curlevel > expected) {
-                    if (maxlevel_.compare_exchange_weak(expected, curlevel, memory_order_acq_rel)) {
-                        updated = true;
-                        break;
-                    }
-                }
-                if (updated) {
-                    enterpoint_node_.store(physical_id, memory_order_release);
-                }
-            }
-        }
+        auto top_candidates = searchLayer(currObj, vec, ef_construction_);
+        mutuallyConnectNewElement(physical_id, top_candidates, 0);
     }
 
 
@@ -1193,37 +1001,23 @@ private:
             visit_bitmap_tls[word] |= (1ull << bit);
         };
 
-        tableint enterpoint_snapshot = enterpoint_node_.load(memory_order_acquire);
-        tableint currObj = enterpoint_snapshot;
-        if (currObj == static_cast<tableint>(-1) || currObj >= node_count) {
-            currObj = 0;
-        }
 
-        dist_t curdist = L2Distance(query, getDataByInternalId(currObj));
+        dist_t curBest = numeric_limits<dist_t>::max();
+        tableint start_ep = 0;
 
-        vector<tableint> neighbors;
-        neighbors.reserve(maxM0_);
+        for(tableint ep : entry_points_){
+            dist_t d = L2Distance(query, getDataByInternalId(ep));
 
-        int maxLevelSnapshot = maxlevel_.load(memory_order_acquire);
-        for (int level = maxLevelSnapshot; level > 0; level--) {
-            bool changed = true;
-            while (changed) {
-                changed = false;
-                collectNeighborsLockFree(currObj, level, neighbors);
-                for (tableint cand : neighbors) {
-                    dist_t d = L2Distance(query, getDataByInternalId(cand));
-                    if (d < curdist) {
-                        curdist = d;
-                        currObj = cand;
-                        changed = true;
-                    }
-                }
+            if(d < curBest){
+                curBest = d;
+                start_ep = ep;
             }
         }
 
-        mark_visited(currObj);
-        candidate_set.emplace(-curdist, currObj);
-        top_candidates.emplace(curdist, currObj);
+        mark_visited(start_ep);
+        candidate_set.emplace(-curBest, start_ep);
+        top_candidates.emplace(curBest, start_ep);
+
 
         const size_t congestion_threshold = k * 6;
 
@@ -1249,7 +1043,7 @@ private:
             }
 
             tableint cid = curr.second;
-            linklistsizeint* ll = getLinkListAtLevel(cid, 0);
+            linklistsizeint* ll = getLinkListAtLevel(cid);
             int c_sz = getListCount(ll);
             tableint* c_ptr = getNeighborsArray(ll);
 
@@ -1300,8 +1094,7 @@ private:
         adj.assign(node_count, {});
 
         for (tableint u = 0; u < static_cast<tableint>(node_count); ++u) {
-            if (0 > element_levels_[u]) continue; // 理论上不会发生
-            linklistsizeint* ll = getLinkListAtLevel(u, 0);
+            linklistsizeint* ll = getLinkListAtLevel(u);
             int sz = getListCount(ll);
             const tableint* ng = getNeighborsArray(ll);
             for (int i = 0; i < sz; ++i) {
@@ -1351,8 +1144,9 @@ private:
 
         size_t bytes_total = max_elements_ * size_data_per_element_;
         char* new_data_level0 = (char*)malloc(bytes_total);
-        if (!new_data_level0) return; 
+        if (!new_data_level0) return;
 
+        // 复制并重映射第 0 层邻接
         for (tableint new_id = 0; new_id < static_cast<tableint>(node_count); ++new_id) {
             tableint old_id = order[new_id];
             char* old_base = data_level0_memory_ + old_id * size_data_per_element_;
@@ -1378,59 +1172,10 @@ private:
                    remain);
         }
 
-        char** new_linkLists = (char**)malloc(sizeof(void*) * max_elements_);
-        if (!new_linkLists) {
-            free(new_data_level0);
-            return;
-        }
-
-        vector<int> new_levels(max_elements_);
-
-        for (tableint new_id = 0; new_id < static_cast<tableint>(node_count); ++new_id) {
-            tableint old_id = order[new_id];
-            new_levels[new_id] = element_levels_[old_id];
-
-            if (element_levels_[old_id] > 0 && linkLists_[old_id]) {
-                size_t bytes = size_links_per_element_ * element_levels_[old_id];
-                char* new_links = (char*)malloc(bytes);
-                if (!new_links) {
-                    new_linkLists[new_id] = nullptr;
-                    continue;
-                }
-                memcpy(new_links, linkLists_[old_id], bytes);
-
-                for (int lvl = 1; lvl <= element_levels_[old_id]; ++lvl) {
-                    linklistsizeint* ll = get_linklist(old_id, lvl);
-                    int sz = getListCount(ll);
-                    tableint* old_arr = getNeighborsArray(ll);
-
-                    linklistsizeint* new_ll = reinterpret_cast<linklistsizeint*>(new_links + (lvl - 1) * size_links_per_element_);
-                    tableint* new_arr = getNeighborsArray(new_ll);
-
-                    for (int i = 0; i < sz; ++i) {
-                        tableint old_nbr = old_arr[i];
-                        if (old_nbr < node_count) {
-                            new_arr[i] = old_to_new[old_nbr];
-                        }
-                    }
-                }
-                new_linkLists[new_id] = new_links;
-            } else {
-                new_linkLists[new_id] = nullptr;
-            }
-        }
-
-        // 其余未使用部分直接保持为空
-        for (tableint id = static_cast<tableint>(node_count); id < static_cast<tableint>(max_elements_); ++id) {
-            new_linkLists[id] = (id < max_elements_) ? linkLists_[id] : nullptr;
-            new_levels[id] = element_levels_[id];
-        }
-
         tableint old_ep = enterpoint_node_.load(memory_order_acquire);
         if (old_ep < node_count) {
             enterpoint_node_.store(old_to_new[old_ep], memory_order_release);
         }
-
 
         vector<tableint> new_physical_to_logical(max_elements_, static_cast<tableint>(-1));
         for (tableint old_phys = 0; old_phys < static_cast<tableint>(node_count); ++old_phys) {
@@ -1443,18 +1188,9 @@ private:
                 }
             }
         }
-        for (tableint id = 0; id < static_cast<tableint>(node_count); ++id) {
-            if (element_levels_[id] > 0 && linkLists_[id]) {
-                free(linkLists_[id]);
-            }
-        }
 
-        free(linkLists_);
         free(data_level0_memory_);
-
         data_level0_memory_ = new_data_level0;
-        linkLists_ = new_linkLists;
-        element_levels_.swap(new_levels);
         physical_to_logical_.swap(new_physical_to_logical);
     }
 
