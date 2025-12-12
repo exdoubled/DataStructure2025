@@ -6,7 +6,7 @@
 - **`main.cpp`**：加载 base/query，构建索引并检索，写出答案文件（默认 `ANSFILEPATH`）
 - **`checker.cpp`**：读取 ground-truth 答案文件，评估/对拍 `solution` 或 `brute`
 
-> 批量实验/断点续跑等内容请参考 `README_experiment.md`（或 experiment 分支）。
+> 批量实验/断点续跑等内容请参考 experiment 分支文档
 
 ---
 
