@@ -1001,13 +1001,22 @@ public:
         out.assign(data, data + size);
     }
 
-    // 距离函数：根据配置选择 L2 或负内积
+    // 距离函数：根据配置选择 L2 或（单位向量下等价的）内积距离
+    //
+    // 重要：很多剪枝逻辑（尤其 gamma 搜索）默认“距离越小越好”且通常为非负。
+    // 若直接用 -dot 作为距离，距离可能为负，剪枝条件会出现方向性问题，导致召回异常偏低。
+    // 因此在 use_negative_inner_product 时，我们将 dot 转成非负距离：
+    //   dist = 1 - dot  （当向量已归一化到单位范数时，与 L2^2/2 单调等价）
     dist_t L2Distance(const float * a, const float * b) const {
         if (config_.count_distance_computation) {
             query_distance_calcs_.fetch_add(1, memory_order_relaxed);
         }
         if (config_.use_negative_inner_product) {
-            return simd_detail::compute_neg_ip_switchable(a, b, dim_, config_.enable_simd);
+            // compute_neg_ip_switchable 返回 -dot(a,b)
+            dist_t dot = -simd_detail::compute_neg_ip_switchable(a, b, dim_, config_.enable_simd);
+            // 数值稳定：限制到 [-1,1]，避免轻微溢出导致 dist 变负
+            dot = std::max<dist_t>(-1.0f, std::min<dist_t>(1.0f, dot));
+            return 1.0f - dot;
         }
         return simd_detail::compute_switchable(a, b, dim_, config_.enable_simd);
     }

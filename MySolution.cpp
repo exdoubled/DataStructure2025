@@ -59,12 +59,13 @@ void Solution::buildWithConfig(int d, const vector<float>& base, const SolutionC
         optimizeGraphDirectly(false, cfg.onng_out_degree, cfg.onng_in_degree, cfg.onng_min_edges);
     }
 
-    initRandomEpoints();
-    
     // ==================== BFS 内存重排 ====================
     if (cfg.enable_bfs) {
         reorderNodesByBFS();
     }
+
+    // 入口点应在所有可能改变物理 ID / 图结构的步骤之后重新初始化
+    initRandomEpoints();
 }
 
 void Solution::search(const vector<float>& query, int *res) {

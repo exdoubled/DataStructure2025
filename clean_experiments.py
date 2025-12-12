@@ -33,6 +33,19 @@ def _import_run_experiments():
 
 def _load_resume(pkl_path: str) -> Dict[str, Any]:
     run_experiments = _import_run_experiments()
+    # 兼容性：如果 pkl 是通过 `python run_experiments.py` 运行生成的，
+    # dataclass 的 qualname 很可能被写成 "__main__.ExperimentResult"。
+    # 当我们从 clean_experiments.py 里反序列化时，__main__ 变成 clean_experiments，
+    # 会导致 AttributeError: Can't get attribute 'ExperimentResult' on <module '__main__'>。
+    # 这里把 run_experiments 里的同名类临时挂到当前 __main__ 模块上，保证旧 pkl 可读。
+    try:
+        import __main__ as _main_mod
+        for _name in ("ExperimentResult", "BuildConfig", "SearchConfig"):
+            if hasattr(run_experiments, _name):
+                setattr(_main_mod, _name, getattr(run_experiments, _name))
+    except Exception:
+        # 仅为兼容旧 pkl；失败也不应阻塞（新 pkl 通常不会依赖该 hack）
+        pass
     if not os.path.exists(pkl_path):
         raise FileNotFoundError(f"Resume pkl not found: {pkl_path}")
     with open(pkl_path, "rb") as f:

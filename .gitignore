@@ -35,5 +35,6 @@ data_o/
 graph_cache
 
 // 实验结果
-experiment_results.csv
-experiment_results.pkl
+experiment_results.csv*
+experiment_results.pkl*
+__pycache__/
