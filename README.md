@@ -1,49 +1,58 @@
-# Build & Run Guide
+# DataStructure（main）：HNSW/ONNG/BFS/SIMD 近邻搜索
+
+主分支聚焦于**主程序**与**对拍/评估工具**
+当前入口：
+
+- **`main.cpp`**：加载 base/query，构建索引并检索，写出答案文件（默认 `ANSFILEPATH`）
+- **`checker.cpp`**：读取 ground-truth 答案文件，评估/对拍 `solution` 或 `brute`
+
+> 批量实验/断点续跑等内容请参考 `README_experiment.md`（或 experiment 分支）。
+
+---
 
 ## 编译器要求
 
-- 支持 C++17 标准，且完整支持 `<thread>` / `<mutex>` 的现代编译器（推荐：GCC ≥ 9，Clang ≥ 10，MSVC ≥ 19.28）。
-- Windows 上若使用 MinGW-w64，请选择 **POSIX 线程变体**（如 MSYS2 UCRT64、x86_64-posix-seh 等），并确保 `g++` 支持并实际传入 `-pthread` 选项；若使用 MSVC，则按默认多线程运行时即可。
+- C++17，且 `<thread>/<mutex>` 可用（GCC/Clang/MSVC 均可）
+- Windows 使用 MinGW-w64 时，建议使用 **POSIX 线程变体**，并确保编译命令带 `-pthread`
 
+---
 
+## 项目结构（主分支）
 
+| 文件 | 说明 |
+|---|---|
+| `main.cpp` | 主程序：生成 query、跑 `solution/brute`、写出答案文件 |
+| `checker.cpp` | 对拍/评估：读取答案文件（带 header 的文本格式），计算 top1/recall/耗时等 |
+| `MySolution.h/.cpp` | HNSW + ONNG + BFS 重排 + SIMD 的实现（含 `SolutionConfig`） |
+| `Brute.h/.cpp` | 暴力解 |
+| `BinaryIO.h` | `.bin` 向量文件读写（header-only，magic 为 `VECBIN1\0`） |
+| `Config.h` | 数据集路径、默认 query/ans 文件名 |
 
-## 项目结构概览
+---
 
-主要文件和目录说明：
+## 数据与路径（`Config.h`）
 
-| 文件                    | 说明                                                        |
-| ----------------------- | ----------------------------------------------------------- |
-| `main.cpp`              | 主程序入口，负责加载数据集、构建索引、搜索并生成 `ans.txt`  |
-| `checker.cpp`           | 对拍程序，使用暴力解与 `MySolution` 的结果进行比对          |
-| `AblationRunner.cpp`    | **消融实验 CLI 工具**，支持参数化构建和搜索，输出 JSON 结果 |
-| `run_experiments.py`    | **Python 自动化脚本**，批量运行消融实验并输出 CSV           |
-| `MySolution.h` / `.cpp` | 近邻搜索实现，基于 HNSW + ONNG + 多线程 + SIMD              |
-| `Brute.h` / `.cpp`      | 朴素暴力搜索实现，用于生成标准答案和对拍                    |
-| `BinaryIO.h`            | 二进制读写工具，负责向量数据和**图缓存**的读写              |
-| `Config.h`              | 配置文件，包含数据集路径和图缓存路径常量                    |
+`Config.h` 定义了：
 
-更好的包装性以及相关实验请查看 **experiment** 分支
+- **数据集路径**：`GLOVEPATH / SIFTPATH / TESTPATH`
+- **默认 query 文件名**：`QUERYFILEPATH`
+- **默认答案文件名**：`ANSFILEPATH`
 
-## 数据集与文件路径
+### `.txt` 与 `.bin`
 
-相关路径在 `Config.h` 中配置：
+- 程序会**优先读取**派生的二进制文件（如 `base.bin`、`query0.bin`）
+- 若 `.bin` 不存在，会从 `.txt` 读取，并可能自动写出 `.bin` 加速后续运行
+- `--bin` 会**强制只从 `.bin` 读取**（找不到/格式不对会直接报错退出）
 
-```cpp
-// 数据集路径
-#define GLOVEPATH "./data_o/glove/base.txt"   // dataset_case = 0, dim=100
-#define SIFTPATH  "./data_o/sift/base.txt"    // dataset_case = 1, dim=128
-#define TESTPATH  "./test.txt"                // dataset_case = 2, 小规模测试
-```
+> 若 base/query 文件缺失，程序会回退到“合成数据（synthetic）”以便调试；这不适合做真实性能/准确率对比。
 
-程序会优先尝试从与 `base.txt` 同目录的 `base.bin` 读取二进制数据；若不存在则从 `base.txt` 读取并自动写出 `base.bin` 以加速后续运行
+---
 
+## C++：主程序（`main.cpp`）
 
-## 主程序用法（`main.cpp`）
+### 编译
 
-### 编译 main
-
-**Windows（MinGW-w64 POSIX）**
+**Windows（PowerShell / MinGW-w64）**
 
 ```pwsh
 g++ -std=c++17 -O2 -Wall -Wextra -pthread main.cpp MySolution.cpp Brute.cpp -o main.exe
@@ -55,109 +64,101 @@ g++ -std=c++17 -O2 -Wall -Wextra -pthread main.cpp MySolution.cpp Brute.cpp -o m
 g++ -std=c++17 -O2 -Wall -Wextra -pthread main.cpp MySolution.cpp Brute.cpp -o main
 ```
 
-### 基本参数
+### 参数（主分支实际支持）
 
-| 参数                     | 说明                            |
-| ------------------------ | ------------------------------- |
-| `0` / `1` / `2`          | 数据集选择：GloVe / SIFT / Test |
-| `--algo=solution\|brute` | 算法选择，默认 `solution`       |
-| `--gen-queries`          | 生成随机查询文件                |
-| `--bin`                  | 强制仅使用二进制文件            |
-| `--query=<path>`         | 指定查询文件路径                |
+- **dataset_case**：位置参数 `0/1/2`（GloVe/SIFT/Test）
+- **`--algo=solution|brute`** 或 `--algo solution|brute`
+- **`--gen-queries`**：生成“极端/覆盖性”query 到 `QUERYFILEPATH`（默认 10000 条）并退出
+- **`--gen-test-base[=N]`**：生成小测试集到 `TESTPATH` 并退出（默认 N=10）
+- **`--query=<path>`** 或 `--query <path>`：覆盖 query 输入路径  
+  - 未指定 `--bin`：按 txt 读取，并派生写出同名 `.bin`
+  - 指定 `--bin`：该路径按 `.bin` 读取
+- **`--bin`**：强制仅从 `.bin` 读取 base/query
+- **`--save-bin-base`**：将 base 数据写出为 `base.bin`（优先写在与 `base.txt` 同目录）
 
-### 常用命令示例
+### 输出文件格式（给 `checker` 用）
+
+`main` 会写出 `ANSFILEPATH`（例如 `ansglove.txt`），包含 header 与结果区块：
+
+- header：`Dataset case:` / `Dimension:` / `Num queries:` 等
+- 结果区块开始行：`Results (top-10 indices per query, space-separated):`
+- 随后每行是一个 query 的 top-10 id（空格分隔）
+
+`checker` 的 `--ans` 需要这种格式才能解析（它会从 `Results (top-` 这一行解析出 K）。
+
+### 常用命令
 
 ```bash
-# 构建索引并搜索
-./main.exe 0 --algo=solution
+# 1) 生成 query（可选）
+./main.exe 0 --gen-queries
 
-# 构建并保存图缓存（首次运行）
-./main.exe 0 --algo=solution --save-graph
-
-# 从缓存加载图（后续运行，跳过构建）
-./main.exe 0 --algo=solution --load-graph
-
-# 使用暴力算法生成标准答案
+# 2) 用 brute 生成 ground-truth（写到 ANSFILEPATH）
 ./main.exe 0 --algo=brute
 
-# 生成随机查询
-./main.exe 0 --gen-queries
+# 3) 跑 solution（注意：也会写到 ANSFILEPATH；如果不想覆盖 gt，请先备份文件或改 Config.h）
+./main.exe 0 --algo=solution
+
+# 4) 强制只从 bin 读取 + 指定自定义 query.bin
+./main.exe 0 --bin --query=query0.bin --algo=solution
 ```
 
+---
 
-## 对拍程序用法（`checker.cpp`）
+## C++：对拍/评估（`checker.cpp`）
 
-### 编译 checker
+### 编译
 
 ```bash
 g++ -std=c++17 -O2 -Wall -Wextra -pthread checker.cpp MySolution.cpp Brute.cpp -o checker.exe
 ```
 
-### 基本参数
+### 参数（主分支实际支持）
 
-| 参数                     | 说明                             |
-| ------------------------ | -------------------------------- |
-| `0` / `1` / `2`          | 数据集选择                       |
-| `--ans=<path>`           | 指定答案文件，默认 `ANSFILEPATH` |
-| `--algo=solution\|brute` | 被测算法，默认 `solution`        |
-| `--first=<N>`            | 只检查前 N 条查询                |
+- **dataset_case**：位置参数 `0/1/2`
+- **`--ans=<path>`** 或 `--ans <path>`：ground-truth 文件（默认 `ANSFILEPATH`）
+- **`--first=<N>`** / `--first <N>` / `--first10`：只评估前 N 条 query（0 表示全部）
+- **`--algo=solution|brute`**：选择要评估的算法（默认 solution）
+- **`--query=<path>`**：覆盖 query 输入路径（逻辑与 main 类似）
+- **`--bin`**：强制仅从 `.bin` 读取 base/query
+- **`--save-bin-base`**：将 base 写出为 `base.bin`
 
-### 常用对拍流程
+### 常用命令
 
 ```bash
-# 1. 生成答案
-./main.exe 0 --algo=solution
+# 使用 brute 结果作为 gt，对拍 solution
+./checker.exe 0 --ans=ansglove.txt --algo=solution
 
-# 2. 对拍（从缓存加载图加速）
-./checker.exe 0 --load-graph --ans="./ans.txt" --algo=solution
+# 只检查前 100 条（也支持 --first100 简写）
+./checker.exe 0 --ans=ansglove.txt --first=100 --algo=solution
 
-# 3. 只检查前 100 条
-./checker.exe 0 --load-graph --first=100
+# 强制从 bin 读 query，并用自定义 query0.bin
+./checker.exe 0 --bin --query=query0.bin --ans=ansglove.txt --algo=solution
 ```
 
+---
 
-## 多线程相关
+## 多线程与 SIMD 说明
 
-- 项目完全依赖 C++ 标准库（`<thread>` / `<mutex>` 等），不需要额外第三方线程库
-- 对于 GCC/Clang，请务必添加 `-pthread`
-- Windows MinGW-w64 请选择 **POSIX 线程变体**
+- 多线程依赖标准库；GCC/Clang 记得带 `-pthread`
+- SIMD 默认在 x86/x64 平台可用；如需强制关闭，参考 `MySolution.h` 的 `SolutionConfig`
 
+---
 
-## SIMD 优化相关
-
-SIMD 加速仅在 x86/x64 平台上启用；其他架构会自动回退到纯标量实现。
-
-`MySolution` 的 L2 距离计算实现了 **运行时指令集分发**：
-
-- 支持：Scalar / SSE / AVX / AVX-512
-- 启动后通过 CPUID + XCR0 自动检测并选择最优实现
-- 可通过 `config.enable_simd = false` 运行时强制使用标量
-
-编译期禁用 SIMD：
+## 快速开始（推荐流程）
 
 ```bash
-# 强制纯标量
-g++ -std=c++17 -O2 -pthread -DSOLUTION_PLATFORM_X86=0 main.cpp MySolution.cpp Brute.cpp -o main.exe
-```
-
-
-## 快速开始
-
-```bash
-# 1. 配置相关参数
-
-# 2. 编译所有工具
+# 1) 编译
 g++ -std=c++17 -O2 -pthread -o main.exe main.cpp MySolution.cpp Brute.cpp
 g++ -std=c++17 -O2 -pthread -o checker.exe checker.cpp MySolution.cpp Brute.cpp
 
-# 3. 生成查询和暴力答案
+# 2) （可选）生成 query
 ./main.exe 0 --gen-queries
+
+# 3) 生成 ground-truth（brute）
 ./main.exe 0 --algo=brute
 
-# 4. 构建索引并保存缓存
-./main.exe 0 --algo=solution
-
-# 5. 对拍验证
-./checker.exe 0 --load-graph --algo=solution
-
+# 4) 对拍 solution（读取上一步的 ans 文件）
+./checker.exe 0 --ans=ansglove.txt --algo=solution
 ```
+
+
