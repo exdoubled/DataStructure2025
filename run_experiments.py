@@ -20,6 +20,7 @@ import time
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Optional, Any
 from pathlib import Path
+import pickle
 
 # ==================== Configuration Constants ====================
 
@@ -32,23 +33,22 @@ GROUNDTRUTH_PATH = "ansglove.txt"  # Ground truth file with true top-K indices
 # Runner executable (without extension - will auto-detect .exe on Windows)
 RUNNER_PATH = "runner"
 
-# Cache directory for graph files
-CACHE_DIR = "graph_cache"
+# Cache directory for graph files (place on SSD)
+CACHE_DIR = r"I:\graph_cache"
 
 # Output file
 OUTPUT_CSV = "experiment_results.csv"
+RESUME_PKL = "experiment_results.pkl"
 
 # Search parameter sweep ranges
 EF_RANGE = [20, 40, 60, 80, 100, 150, 200, 300, 400, 600, 700, 800, 1000]
-GAMMA_RANGE = [0.0, 0.1, 0.14, 0.16, 0.17, 0.18, 0.19, 0.2, 0.21, 0.22]
+GAMMA_RANGE = [0.0, 0.1, 0.14, 0.16, 0.17, 0.18, 0.19, 0.2, 0.21, 0.22, 0.23, 0.3]
 
-# For Group E: M sweep
-M_RANGE = [24, 48, 96, 128, 200, 256]
-EF_RANGE_FOR_M_SWEEP = [40, 100, 200, 400, 500, 600, 700, 800, 900, 1000]
+# Build parameter sweeps
+M_RANGE = [24, 48, 96, 128]
+EFC_RANGE = [200, 300, 400, 500]
 
-# Default build parameters
-DEFAULT_M = 96  # Groups A, B, C, D use M=96
-DEFAULT_EFC = 400
+# 默认 top-K
 DEFAULT_K = 10
 
 # ==================== Data Classes ====================
@@ -56,17 +56,27 @@ DEFAULT_K = 10
 @dataclass
 class BuildConfig:
     """Configuration for graph building"""
-    M: int = DEFAULT_M
-    efC: int = DEFAULT_EFC
+    M: int = 96
+    efC: int = 400
     onng: bool = True
     onng_out: int = 96
     onng_in: int = 144
     onng_min: int = 64
     bfs: bool = True
-    
+    single_layer: bool = True
+    neg_ip: bool = True
+    simd: bool = True
+
     def get_cache_filename(self) -> str:
         """Generate unique cache filename based on build parameters"""
-        param_str = f"M{self.M}_efC{self.efC}_onng{int(self.onng)}_bfs{int(self.bfs)}"
+        param_str = (
+            f"L{int(self.single_layer)}"
+            f"_neg{int(self.neg_ip)}"
+            f"_simd{int(self.simd)}"
+            f"_M{self.M}_efC{self.efC}"
+            f"_onng{int(self.onng)}"
+            f"_bfs{int(self.bfs)}"
+        )
         if self.onng:
             param_str += f"_oo{self.onng_out}_oi{self.onng_in}_om{self.onng_min}"
         # Add hash for extra uniqueness
@@ -77,11 +87,11 @@ class BuildConfig:
 @dataclass
 class SearchConfig:
     """Configuration for search"""
-    strategy: str = "fixed"  # "fixed" or "gamma"
+    strategy: str = "fixed"  # "fixed", "gamma", "gamma-static"
     ef: int = 100
     gamma: float = 0.19
     k: int = DEFAULT_K
-    simd: bool = True
+    count_dist: bool = False
 
 
 @dataclass
@@ -93,6 +103,8 @@ class ExperimentResult:
     onng: bool
     bfs: bool
     simd: bool
+    single_layer: bool
+    neg_ip: bool
     strategy: str
     param_val: float  # ef or gamma value
     top1: float = 0.0
@@ -110,7 +122,10 @@ def build_runner_command(
     build_cfg: BuildConfig,
     search_cfg: SearchConfig,
     cache_path: str,
-    count_dist: bool = False
+    count_dist: bool = False,
+    opt_only: bool = False,
+    cache_out: str = "",
+    opt_order: str = "onng-first"
 ) -> List[str]:
     """Build the command line arguments for the runner"""
     cmd = [RUNNER_PATH]
@@ -134,22 +149,34 @@ def build_runner_command(
     
     if not build_cfg.bfs:
         cmd.append("--no-bfs")
+
+    if build_cfg.single_layer:
+        cmd.append("--single-layer")
+
+    if build_cfg.neg_ip:
+        cmd.append("--use-neg-ip")
+
+    if not build_cfg.simd:
+        cmd.append("--no-simd")
     
     # Search args
     cmd.extend([f"--k={search_cfg.k}"])
     cmd.extend([f"--strategy={search_cfg.strategy}"])
     
-    if search_cfg.strategy == "gamma":
+    if search_cfg.strategy.startswith("gamma"):
         cmd.extend([f"--gamma={search_cfg.gamma}"])
     else:
         cmd.extend([f"--ef={search_cfg.ef}"])
     
-    if not search_cfg.simd:
-        cmd.append("--no-simd")
-    
-    # Debug args
+    # Debug / opt args
     if count_dist:
         cmd.append("--count-dist")
+    if opt_only:
+        cmd.append("--opt-only")
+        if cache_out:
+            cmd.append(f"--cache-out={cache_out}")
+        if opt_order:
+            cmd.append(f"--opt-order={opt_order}")
     
     return cmd
 
@@ -164,15 +191,18 @@ def run_single_experiment(
     cmd = build_runner_command(build_cfg, search_cfg, cache_path, count_dist)
     
     try:
+        print(f"[RUN] {' '.join(cmd)}", flush=True)
         result = subprocess.run(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
             timeout=3600  # 1 hour timeout
         )
         
         if result.returncode != 0:
-            print(f"  [ERROR] Runner failed: {result.stderr[:200]}", file=sys.stderr)
+            msg = result.stdout[-500:] if result.stdout else ""
+            print(f"  [ERROR] Runner failed: {msg}", file=sys.stderr)
             return None
         
         # Parse JSON from stdout (last non-empty line)
@@ -195,6 +225,79 @@ def run_single_experiment(
     except Exception as e:
         print(f"  [ERROR] Exception: {e}", file=sys.stderr)
         return None
+
+
+def save_resume(results: List[ExperimentResult], idx: int, total: int):
+    """Save resume checkpoint"""
+    try:
+        with open(RESUME_PKL, "wb") as f:
+            # 兼容：idx/total 仅用于展示；真正的续跑靠 results 去重
+            pickle.dump({"results": results, "idx": idx, "total": total}, f)
+    except Exception as e:
+        print(f"[WARN] Failed to save resume file: {e}", file=sys.stderr)
+
+
+def load_resume():
+    """Load resume checkpoint"""
+    if not os.path.exists(RESUME_PKL):
+        return None
+    try:
+        with open(RESUME_PKL, "rb") as f:
+            data = pickle.load(f)
+            return data
+    except Exception as e:
+        print(f"[WARN] Failed to load resume file: {e}", file=sys.stderr)
+        return None
+
+
+def exp_key(group_name: str, build_cfg: BuildConfig, search_strategy: str, param_val: float) -> str:
+    """
+    为“一个 experiment_result（两次搜索合并后）”生成稳定 key。
+    注意：param_val 对 gamma 用 6 位小数，对 ef 用整数表示。
+    """
+    if search_strategy.startswith("gamma"):
+        p = f"g={param_val:.6f}"
+    else:
+        p = f"ef={int(param_val)}"
+    return (
+        f"{group_name}"
+        f"|M={build_cfg.M}|efC={build_cfg.efC}"
+        f"|onng={int(build_cfg.onng)}|bfs={int(build_cfg.bfs)}"
+        f"|simd={int(build_cfg.simd)}|single_layer={int(build_cfg.single_layer)}|neg_ip={int(build_cfg.neg_ip)}"
+        f"|strategy={search_strategy}|{p}"
+    )
+
+
+def run_opt_only(
+    build_cfg: BuildConfig,
+    cache_in: str,
+    cache_out: str,
+    enable_onng: bool,
+    enable_bfs: bool,
+    opt_order: str = "onng-first"
+) -> bool:
+    """Run runner in opt-only mode to derive new cache"""
+    tmp_build = BuildConfig(**asdict(build_cfg))
+    tmp_build.onng = enable_onng
+    tmp_build.bfs = enable_bfs
+    # onng params already in build_cfg
+    dummy_search = SearchConfig(strategy="fixed", ef=EF_RANGE[0], gamma=GAMMA_RANGE[0])
+    cmd = build_runner_command(tmp_build, dummy_search, cache_in, count_dist=False,
+                               opt_only=True, cache_out=cache_out, opt_order=opt_order)
+    try:
+        print(f"[RUN OPT] {' '.join(cmd)}", flush=True)
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=1800)
+        if result.returncode != 0:
+            msg = result.stdout[-500:] if result.stdout else ""
+            print(f"[ERROR] opt-only failed: {msg}", file=sys.stderr)
+            return False
+        return True
+    except subprocess.TimeoutExpired:
+        print("[ERROR] opt-only timed out", file=sys.stderr)
+        return False
+    except Exception as e:
+        print(f"[ERROR] opt-only exception: {e}", file=sys.stderr)
+        return False
 
 
 def run_two_pass_experiment(
@@ -224,7 +327,9 @@ def run_two_pass_experiment(
         efC=build_cfg.efC,
         onng=build_cfg.onng,
         bfs=build_cfg.bfs,
-        simd=search_cfg.simd,
+        simd=build_cfg.simd,
+        single_layer=build_cfg.single_layer,
+        neg_ip=build_cfg.neg_ip,
         strategy=search_cfg.strategy,
         param_val=param_val,
         recall10=perf_result.get("recall", 0.0),
@@ -248,7 +353,14 @@ def run_two_pass_experiment(
     return result
 
 
-# ==================== Experiment Groups ====================
+"""
+实验分组：按 5 位编码 (单/多层, onng, bfs, simd, neg_ip) 以及 3 档策略 (gamma 动态 / gamma 静态 / fixed ef) 扫描。
+为减少冗余：
+ - onng=0 时不扫 onng 参数，使用基于 M 的默认派生值
+ - onng=1 时 onng_out/onng_in/onng_min 随 M 自动派生（避免全笛卡尔爆炸）
+ - 两次搜索：一次正常，一次 --count-dist，用同一缓存
+"""
+
 
 def ensure_cache_dir():
     """Ensure cache directory exists"""
@@ -260,157 +372,138 @@ def get_cache_path(build_cfg: BuildConfig) -> str:
     return os.path.join(CACHE_DIR, build_cfg.get_cache_filename())
 
 
-def run_group_a_baseline(results: List[ExperimentResult]):
-    """
-    Group A: Search Strategy Comparison (Baseline)
-    Build: M=96, efC=400, ONNG=True, BFS=True
-    Run 1: Strategy=Fixed, sweep ef
-    Run 2: Strategy=Gamma, sweep gamma
-    """
-    print("\n" + "="*60)
-    print("GROUP A: Search Strategy Comparison (Baseline)")
-    print("="*60)
-    
-    build_cfg = BuildConfig(M=DEFAULT_M, efC=DEFAULT_EFC, onng=True, bfs=True)
-    cache_path = get_cache_path(build_cfg)
-    
-    # Run 1: Fixed EF sweep
-    print("\n[A.1] Strategy=Fixed, sweeping EF...")
-    for ef in EF_RANGE:
-        print(f"  Running: ef={ef}...", end=" ", flush=True)
-        search_cfg = SearchConfig(strategy="fixed", ef=ef, simd=True)
-        result = run_two_pass_experiment("A_Baseline_Fixed", build_cfg, search_cfg, cache_path, float(ef))
-        if result:
-            results.append(result)
-            print(f"Recall={result.recall10:.4f}, QPS={result.qps:.1f}")
-        else:
-            print("FAILED")
-    
-    # Run 2: Gamma sweep
-    print("\n[A.2] Strategy=Gamma, sweeping gamma...")
-    for gamma in GAMMA_RANGE:
-        print(f"  Running: gamma={gamma}...", end=" ", flush=True)
-        search_cfg = SearchConfig(strategy="gamma", gamma=gamma, simd=True)
-        result = run_two_pass_experiment("A_Baseline_Gamma", build_cfg, search_cfg, cache_path, gamma)
-        if result:
-            results.append(result)
-            print(f"Recall={result.recall10:.4f}, QPS={result.qps:.1f}")
-        else:
-            print("FAILED")
+def derive_onng_params(M: int):
+    """派生 ONNG 参数：按默认最优 (M=96, oo=96, oi=144, om=64) 等比例缩放"""
+    onng_out = M                                  # 96 -> 96
+    onng_in = max(M, int(M * (144.0 / 96.0)))     # 1.5x
+    onng_min = max(16, int(M * (64.0 / 96.0)))    # ~0.67x
+    return onng_out, onng_in, onng_min
 
 
-def run_group_b_no_onng(results: List[ExperimentResult]):
-    """
-    Group B: Ablation - Graph Optimization (No ONNG)
-    Build: M=96, efC=400, ONNG=False, BFS=True
-    Run: Strategy=Gamma, sweep gamma
-    """
-    print("\n" + "="*60)
-    print("GROUP B: Ablation - No ONNG")
-    print("="*60)
-    
-    build_cfg = BuildConfig(M=DEFAULT_M, efC=DEFAULT_EFC, onng=False, bfs=True)
-    cache_path = get_cache_path(build_cfg)
-    
-    print("\n[B] Strategy=Gamma, sweeping gamma (No ONNG)...")
-    for gamma in GAMMA_RANGE:
-        print(f"  Running: gamma={gamma}...", end=" ", flush=True)
-        search_cfg = SearchConfig(strategy="gamma", gamma=gamma, simd=True)
-        result = run_two_pass_experiment("B_NoONNG", build_cfg, search_cfg, cache_path, gamma)
-        if result:
-            results.append(result)
-            print(f"Recall={result.recall10:.4f}, QPS={result.qps:.1f}")
-        else:
-            print("FAILED")
+def run_code_group(code_bits: str, results: List[ExperimentResult], done_keys: set, progress_cb=None):
+    """按 5 位编码跑三种策略"""
+    assert len(code_bits) == 5 and set(code_bits) <= {"0", "1"}
 
+    single_layer = (code_bits[0] == "1")
+    use_onng = (code_bits[1] == "1")
+    use_bfs = (code_bits[2] == "1")
+    use_simd = (code_bits[3] == "1")
+    use_neg_ip = (code_bits[4] == "1")
 
-def run_group_c_no_bfs(results: List[ExperimentResult]):
-    """
-    Group C: Ablation - Memory Layout (No BFS)
-    Build: M=96, efC=400, ONNG=True, BFS=False
-    Run: Strategy=Gamma, sweep gamma
-    """
-    print("\n" + "="*60)
-    print("GROUP C: Ablation - No BFS Reordering")
-    print("="*60)
-    
-    build_cfg = BuildConfig(M=DEFAULT_M, efC=DEFAULT_EFC, onng=True, bfs=False)
-    cache_path = get_cache_path(build_cfg)
-    
-    print("\n[C] Strategy=Gamma, sweeping gamma (No BFS)...")
-    for gamma in GAMMA_RANGE:
-        print(f"  Running: gamma={gamma}...", end=" ", flush=True)
-        search_cfg = SearchConfig(strategy="gamma", gamma=gamma, simd=True)
-        result = run_two_pass_experiment("C_NoBFS", build_cfg, search_cfg, cache_path, gamma)
-        if result:
-            results.append(result)
-            print(f"Recall={result.recall10:.4f}, QPS={result.qps:.1f}")
-        else:
-            print("FAILED")
+    group_prefix = code_bits
 
-
-def run_group_d_no_simd(results: List[ExperimentResult]):
-    """
-    Group D: Ablation - Instruction Set (No SIMD)
-    Build: M=96, efC=400, ONNG=True, BFS=True
-    Run: Strategy=Gamma, sweep gamma (with --no-simd flag)
-    """
-    print("\n" + "="*60)
-    print("GROUP D: Ablation - No SIMD (Scalar Distance)")
-    print("="*60)
-    
-    build_cfg = BuildConfig(M=DEFAULT_M, efC=DEFAULT_EFC, onng=True, bfs=True)
-    cache_path = get_cache_path(build_cfg)
-    
-    print("\n[D] Strategy=Gamma, sweeping gamma (No SIMD)...")
-    for gamma in GAMMA_RANGE:
-        print(f"  Running: gamma={gamma}...", end=" ", flush=True)
-        search_cfg = SearchConfig(strategy="gamma", gamma=gamma, simd=False)
-        result = run_two_pass_experiment("D_NoSIMD", build_cfg, search_cfg, cache_path, gamma)
-        if result:
-            results.append(result)
-            print(f"Recall={result.recall10:.4f}, QPS={result.qps:.1f}")
-        else:
-            print("FAILED")
-
-
-def run_group_e_m_sweep(results: List[ExperimentResult]):
-    """
-    Group E: Impact of Graph Density (M)
-    Build: Sweep M in [24, 48, 96, 128, 200, 256], ONNG=True, BFS=True
-    Run: Strategy=Gamma, sweep gamma
-    """
-    print("\n" + "="*60)
-    print("GROUP E: Graph Density (M) Impact")
-    print("="*60)
-    
     for M in M_RANGE:
-        print(f"\n[E] M={M}, sweeping gamma...")
-        
-        # Adjust ONNG params based on M
-        onng_out = M
-        onng_in = int(M * 1.5)
-        onng_min = max(16, M // 2)
-        
-        build_cfg = BuildConfig(
-            M=M, efC=DEFAULT_EFC, 
-            onng=True, onng_out=onng_out, onng_in=onng_in, onng_min=onng_min,
-            bfs=True
-        )
-        cache_path = get_cache_path(build_cfg)
-        
-        for gamma in GAMMA_RANGE:
-            print(f"  Running: M={M}, gamma={gamma}...", end=" ", flush=True)
-            search_cfg = SearchConfig(strategy="gamma", gamma=gamma, simd=True)
-            result = run_two_pass_experiment(f"E_M{M}", build_cfg, search_cfg, cache_path, gamma)
-            if result:
-                results.append(result)
-                print(f"Recall={result.recall10:.4f}, QPS={result.qps:.1f}")
-            else:
-                print("FAILED")
+        for efC in EFC_RANGE:
+            # ONNG 参数派生
+            onng_out, onng_in, onng_min = derive_onng_params(M)
 
+            # 基础图（无 ONNG/BFS）缓存
+            base_cfg = BuildConfig(
+                M=M,
+                efC=efC,
+                onng=False,
+                onng_out=onng_out,
+                onng_in=onng_in,
+                onng_min=onng_min,
+                bfs=False,
+                single_layer=single_layer,
+                neg_ip=use_neg_ip,
+                simd=use_simd,
+            )
+            base_cache = get_cache_path(base_cfg)
 
-# ==================== Output ====================
+            if not os.path.exists(base_cache):
+                # 构建基础图（最小化搜索，目的是生成缓存）
+                print(f"  [BUILD base] code={code_bits} M={M} efC={efC} -> {base_cache}")
+                build_search_cfg = SearchConfig(strategy="fixed", ef=EF_RANGE[0], gamma=GAMMA_RANGE[0])
+                ok = run_single_experiment(base_cfg, build_search_cfg, base_cache, count_dist=False)
+                if ok is None:
+                    print("    [ERROR] build base failed")
+                    continue
+
+            # 目标图（按 onng/bfs）
+            target_cfg = BuildConfig(
+                M=M,
+                efC=efC,
+                onng=use_onng,
+                onng_out=onng_out,
+                onng_in=onng_in,
+                onng_min=onng_min,
+                bfs=use_bfs,
+                single_layer=single_layer,
+                neg_ip=use_neg_ip,
+                simd=use_simd,
+            )
+            final_cache = get_cache_path(target_cfg)
+
+            if not os.path.exists(final_cache):
+                # 生成目标缓存：onng -> bfs（如需）
+                current_cache = base_cache
+                if use_onng:
+                    inter_cache = final_cache if not use_bfs else final_cache + ".onngtmp"
+                    if not os.path.exists(inter_cache):
+                        ok_onng = run_opt_only(target_cfg, current_cache, inter_cache,
+                                               enable_onng=True, enable_bfs=False, opt_order="onng-first")
+                        if not ok_onng:
+                            print("    [ERROR] opt-only onng failed")
+                            continue
+                    current_cache = inter_cache
+                if use_bfs:
+                    if not os.path.exists(final_cache):
+                        ok_bfs = run_opt_only(target_cfg, current_cache, final_cache,
+                                              enable_onng=False, enable_bfs=True, opt_order="onng-first")
+                        if not ok_bfs:
+                            print("    [ERROR] opt-only bfs failed")
+                            continue
+                else:
+                    # 如果只做 ONNG，且 final_cache 还未生成（inter_cache==final_cache 已处理）
+                    if use_onng and current_cache != final_cache and not os.path.exists(final_cache):
+                        os.replace(current_cache, final_cache)
+
+            cache_path = final_cache
+
+            # 策略 1: gamma 动态
+            for gamma in GAMMA_RANGE:
+                search_cfg = SearchConfig(strategy="gamma", gamma=gamma, ef=EF_RANGE[0])  # ef占位
+                gname = f"{group_prefix}_gamma_dyn"
+                k = exp_key(gname, target_cfg, search_cfg.strategy, gamma)
+                if k in done_keys:
+                    continue
+                result = run_two_pass_experiment(gname, target_cfg, search_cfg, cache_path, gamma)
+                if result:
+                    results.append(result)
+                    done_keys.add(k)
+                    if progress_cb:
+                        progress_cb(1)
+
+            # 策略 2: gamma 静态
+            for gamma in GAMMA_RANGE:
+                search_cfg = SearchConfig(strategy="gamma-static", gamma=gamma, ef=EF_RANGE[0])  # ef占位
+                gname = f"{group_prefix}_gamma_static"
+                k = exp_key(gname, target_cfg, search_cfg.strategy, gamma)
+                if k in done_keys:
+                    continue
+                result = run_two_pass_experiment(gname, target_cfg, search_cfg, cache_path, gamma)
+                if result:
+                    results.append(result)
+                    done_keys.add(k)
+                    if progress_cb:
+                        progress_cb(1)
+
+            # 策略 3: 固定 EF
+            for ef in EF_RANGE:
+                search_cfg = SearchConfig(strategy="fixed", ef=ef, gamma=GAMMA_RANGE[0])
+                gname = f"{group_prefix}_fixed"
+                k = exp_key(gname, target_cfg, search_cfg.strategy, float(ef))
+                if k in done_keys:
+                    continue
+                result = run_two_pass_experiment(gname, target_cfg, search_cfg, cache_path, float(ef))
+                if result:
+                    results.append(result)
+                    done_keys.add(k)
+                    if progress_cb:
+                        progress_cb(1)
+
 
 def save_results_to_csv(results: List[ExperimentResult], filename: str):
     """Save all results to CSV file"""
@@ -419,7 +512,7 @@ def save_results_to_csv(results: List[ExperimentResult], filename: str):
         return
     
     fieldnames = [
-        "group_name", "M", "efC", "onng", "bfs", "simd",
+        "group_name", "M", "efC", "onng", "bfs", "simd", "single_layer", "neg_ip",
         "strategy", "param_val", "top1", "recall10", 
         "qps", "ms_per_query", "latency_ms", "dist_calcs", "build_time_ms"
     ]
@@ -436,6 +529,8 @@ def save_results_to_csv(results: List[ExperimentResult], filename: str):
                 "onng": r.onng,
                 "bfs": r.bfs,
                 "simd": r.simd,
+                "single_layer": r.single_layer,
+                "neg_ip": r.neg_ip,
                 "strategy": r.strategy,
                 "param_val": r.param_val,
                 "top1": f"{r.top1:.6f}",
@@ -491,7 +586,7 @@ def main():
     global RUNNER_PATH  # Declare global at the start of function
     
     print("="*60)
-    print("ANN Ablation Study - Experiment Runner")
+    print("ANN Ablation Study - Experiment Runner (Code-driven)")
     print("="*60)
     
     # Check runner exists (handle Windows/Linux differences)
@@ -531,20 +626,51 @@ def main():
     # Ensure cache directory exists
     ensure_cache_dir()
     
-    # Collect all results
+    # Collect all results (resume support)
     all_results: List[ExperimentResult] = []
+    resume_state = load_resume()
+    selected_codes = ["00000", "11111", "11110", "11101", "11011", "10111", "01111"]
+    total_tasks = len(selected_codes) * len(M_RANGE) * len(EFC_RANGE) * (len(GAMMA_RANGE)*2 + len(EF_RANGE))
+    completed = 0
+    done_keys: set = set()
+    if resume_state:
+        all_results = resume_state.get("results", [])
+        # 基于 results 重建完成集合，避免修改 code/total 后 idx 失真
+        for r in all_results:
+            # 这里用 result 自身字段生成 key（param_val 已是数值）
+            bc = BuildConfig(
+                M=r.M, efC=r.efC, onng=r.onng,
+                onng_out=0, onng_in=0, onng_min=0,  # 不影响 key（exp_key 用 build_cfg 中的这些布尔/核心参数）
+                bfs=r.bfs, single_layer=r.single_layer, neg_ip=r.neg_ip, simd=r.simd
+            )
+            done_keys.add(exp_key(r.group_name, bc, r.strategy, float(r.param_val)))
+        completed = len(done_keys)
+        print(f"[RESUME] Loaded checkpoint: completed={completed}/{total_tasks}, results={len(all_results)}")
+    else:
+        print(f"[INFO] Total tasks to run: {total_tasks}")
     
     start_time = time.time()
     
-    # Run all experiment groups
     try:
-        run_group_a_baseline(all_results)
-        run_group_b_no_onng(all_results)
-        run_group_c_no_bfs(all_results)
-        run_group_d_no_simd(all_results)
-        run_group_e_m_sweep(all_results)
+        task_idx = 0
+        def progress_cb(step):
+            nonlocal task_idx
+            task_idx += step
+            if task_idx % 50 == 0:
+                cur = completed + task_idx
+                print(f"[PROGRESS] {cur}/{total_tasks} tasks done in current run segment", flush=True)
+                save_resume(all_results, cur, total_tasks)
+
+        for code_bits in selected_codes:
+            print(f"\n{'='*40}\nRunning code {code_bits}\n{'='*40}")
+            run_code_group(code_bits, all_results, done_keys=done_keys, progress_cb=progress_cb)
+            completed += task_idx
+            task_idx = 0
+            print(f"[INFO] Finished code {code_bits}, progress {completed}/{total_tasks}", flush=True)
+            save_resume(all_results, completed, total_tasks)
     except KeyboardInterrupt:
         print("\n\nInterrupted by user. Saving partial results...")
+        save_resume(all_results, completed, total_tasks)
     
     elapsed = time.time() - start_time
     

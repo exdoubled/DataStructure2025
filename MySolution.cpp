@@ -30,7 +30,7 @@ void Solution::buildWithConfig(int d, const vector<float>& base, const SolutionC
     if (worker_count_ == 1) {
         for (size_t i = 0; i < n; ++i) {
             const float* vec = &base[i * dim_];
-            insert(vec);
+            insert(vec, -1);
         }
     } else {
         // 多线程插入
@@ -40,7 +40,7 @@ void Solution::buildWithConfig(int d, const vector<float>& base, const SolutionC
                 size_t idx = next_index.fetch_add(1, std::memory_order_relaxed);
                 if (idx >= n) break;
                 const float* vec = &base[idx * dim_];
-                insert(vec);
+                insert(vec, -1);
             }
         };
 
@@ -56,7 +56,7 @@ void Solution::buildWithConfig(int d, const vector<float>& base, const SolutionC
 
     // ==================== ONNG 优化 ====================
     if (cfg.enable_onng) {
-        constructAdjustedGraph(cfg.onng_out_degree, cfg.onng_in_degree, cfg.onng_min_edges);
+        optimizeGraphDirectly(false, cfg.onng_out_degree, cfg.onng_in_degree, cfg.onng_min_edges);
     }
 
     initRandomEpoints();
@@ -80,16 +80,17 @@ void Solution::searchWithK(const vector<float>& query, int *res, size_t k) {
         case SearchMethod::FIXED_EF:
             searchKNN_FixedEF(query.data(), res, k, config_.ef_search);
             break;
-        case SearchMethod::ADAPTIVE_GAMMA:
-        default:
-            // Use adaptive gamma search
-            // Note: searchKNN uses fixed k=10, we need to handle variable k
+        case SearchMethod::STATIC_GAMMA:
+        case SearchMethod::DYNAMIC_GAMMA:
+        default: {
+            bool dynamic = (config_.search_method == SearchMethod::DYNAMIC_GAMMA);
             if (k == 10) {
-                searchKNN(query.data(), res, config_.gamma);
+                searchKNN(query.data(), res, config_.gamma, dynamic);
             } else {
-                // For k != 10, fall back to fixed EF with larger ef
+                // k != 10 时使用固定 EF 回退
                 searchKNN_FixedEF(query.data(), res, k, max(config_.ef_search, k * 10));
             }
             break;
+        }
     }
 }

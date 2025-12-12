@@ -45,6 +45,7 @@ Output:
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>
+#include <fstream>
 
 #include "MySolution.h"
 #include "BinaryIO.h"
@@ -68,10 +69,16 @@ struct AblationArgs {
     bool enable_onng = true;
     bool enable_bfs = true;
     bool enable_simd = true;
+    bool enable_multilayer = true;
+    bool use_negative_inner_product = false;
+    bool opt_only = false;
+    std::string cache_out;
+    std::string opt_order = "onng-first"; // or "bfs-first"
+    bool log_to_file = false;
     
     // Search params
     size_t k = 10;
-    std::string strategy = "gamma";  // "gamma" or "fixed"
+    std::string strategy = "gamma";  // "gamma" (dynamic), "gamma-static", "fixed"
     float gamma = 0.19f;
     size_t ef_search = 100;
     
@@ -113,10 +120,16 @@ Build Options:
   --no-onng            Disable ONNG
   --no-bfs             Disable BFS reorder
   --no-simd            Force scalar distance
+  --single-layer       Disable multi-layer graph (use single-layer)
+  --use-neg-ip         Use negative inner product instead of L2
+  --opt-only           Load cache, apply ONNG/BFS, save, and exit (no search)
+  --cache-out=<path>   Output cache path when --opt-only is used (default: overwrite cache-path)
+  --opt-order=<s>      "onng-first" (default) or "bfs-first" when both are enabled
+  --log-to-file        Write stderr/logs to a file next to cache (cache-path + ".log")
 
 Search Options:
   --k=<int>            Top-K (default: 10)
-  --strategy=<s>       "gamma" or "fixed" (default: gamma)
+  --strategy=<s>       "gamma" (dynamic, default) | "gamma-static" | "fixed"
   --gamma=<float>      Gamma value (default: 0.19)
   --ef=<int>           Fixed ef (default: 100)
 
@@ -156,6 +169,18 @@ static bool parse_args(int argc, char** argv, AblationArgs& args) {
             args.enable_bfs = false;
         } else if (arg == "--no-simd") {
             args.enable_simd = false;
+        } else if (arg == "--single-layer") {
+            args.enable_multilayer = false;
+        } else if (arg == "--use-neg-ip") {
+            args.use_negative_inner_product = true;
+        } else if (arg == "--opt-only") {
+            args.opt_only = true;
+        } else if (arg.rfind("--cache-out=", 0) == 0) {
+            args.cache_out = arg.substr(12);
+        } else if (arg.rfind("--opt-order=", 0) == 0) {
+            args.opt_order = arg.substr(12);
+        } else if (arg == "--log-to-file") {
+            args.log_to_file = true;
         }
         // Search
         else if (arg.rfind("--k=", 0) == 0) {
@@ -178,17 +203,24 @@ static bool parse_args(int argc, char** argv, AblationArgs& args) {
     }
     
     // Validate required args
-    if (args.data_path.empty()) {
-        std::cerr << "Error: --data is required\n";
-        return false;
-    }
-    if (args.query_path.empty()) {
-        std::cerr << "Error: --query is required\n";
-        return false;
-    }
-    if (args.groundtruth_path.empty()) {
-        std::cerr << "Error: --groundtruth is required\n";
-        return false;
+    if (!args.opt_only) {
+        if (args.data_path.empty()) {
+            std::cerr << "Error: --data is required\n";
+            return false;
+        }
+        if (args.query_path.empty()) {
+            std::cerr << "Error: --query is required\n";
+            return false;
+        }
+        if (args.groundtruth_path.empty()) {
+            std::cerr << "Error: --groundtruth is required\n";
+            return false;
+        }
+    } else {
+        if (args.cache_path.empty()) {
+            std::cerr << "Error: --cache-path is required for --opt-only\n";
+            return false;
+        }
     }
     
     return true;
@@ -405,33 +437,52 @@ int main(int argc, char** argv) {
     if (!parse_args(argc, argv, args)) {
         return 1;
     }
+
+    // 准备日志输出
+    std::unique_ptr<std::ofstream> log_file;
+    std::streambuf* cerr_buf = std::cerr.rdbuf();
+    if (args.log_to_file && !args.cache_path.empty()) {
+        std::string log_path = args.cache_path + ".log";
+        log_file = std::make_unique<std::ofstream>(log_path, std::ios::app);
+        if (log_file->is_open()) {
+            std::cerr.rdbuf(log_file->rdbuf());
+            std::cerr << "[LOG] Redirecting stderr to " << log_path << "\n";
+        } else {
+            std::cerr << "[WARN] Failed to open log file: " << log_path << ", fallback to stderr.\n";
+            log_file.reset();
+        }
+    }
     
-    // Load data
+    // 如果 opt-only，只需要缓存，不加载数据/查询/真值
     std::vector<float> base_data;
-    if (!load_base_data(args.data_path, args.dim, base_data)) {
-        std::cerr << "Error: Failed to load base data from: " << args.data_path << "\n";
-        return 1;
-    }
-    args.base_count = base_data.size() / args.dim;
-    
     std::vector<std::vector<float>> queries;
-    if (!load_queries(args.query_path, args.dim, queries)) {
-        std::cerr << "Error: Failed to load queries from: " << args.query_path << "\n";
-        return 1;
-    }
-    args.query_count = queries.size();
-    
     std::vector<std::vector<int>> groundtruth;
-    if (!load_groundtruth(args.groundtruth_path, args.k, groundtruth)) {
-        std::cerr << "Error: Failed to load groundtruth from: " << args.groundtruth_path << "\n";
-        return 1;
-    }
-    
-    if (groundtruth.size() < queries.size()) {
-        std::cerr << "Warning: groundtruth count (" << groundtruth.size() 
-                  << ") < query count (" << queries.size() << ")\n";
-        queries.resize(groundtruth.size());
+
+    if (!args.opt_only) {
+        // Load data
+        if (!load_base_data(args.data_path, args.dim, base_data)) {
+            std::cerr << "Error: Failed to load base data from: " << args.data_path << "\n";
+            return 1;
+        }
+        args.base_count = base_data.size() / args.dim;
+        
+        if (!load_queries(args.query_path, args.dim, queries)) {
+            std::cerr << "Error: Failed to load queries from: " << args.query_path << "\n";
+            return 1;
+        }
         args.query_count = queries.size();
+        
+        if (!load_groundtruth(args.groundtruth_path, args.k, groundtruth)) {
+            std::cerr << "Error: Failed to load groundtruth from: " << args.groundtruth_path << "\n";
+            return 1;
+        }
+        
+        if (groundtruth.size() < queries.size()) {
+            std::cerr << "Warning: groundtruth count (" << groundtruth.size() 
+                      << ") < query count (" << queries.size() << ")\n";
+            queries.resize(groundtruth.size());
+            args.query_count = queries.size();
+        }
     }
     
     // Build configuration
@@ -444,12 +495,46 @@ int main(int argc, char** argv) {
     config.onng_min_edges = args.onng_min;
     config.enable_bfs = args.enable_bfs;
     config.enable_simd = args.enable_simd;
+    config.enable_multilayer = args.enable_multilayer;
+    config.use_negative_inner_product = args.use_negative_inner_product;
     config.k = args.k;
     config.gamma = args.gamma;
     config.ef_search = args.ef_search;
-    config.search_method = (args.strategy == "fixed") ? SearchMethod::FIXED_EF : SearchMethod::ADAPTIVE_GAMMA;
+    if (args.strategy == "fixed") {
+        config.search_method = SearchMethod::FIXED_EF;
+    } else if (args.strategy == "gamma-static") {
+        config.search_method = SearchMethod::STATIC_GAMMA;
+    } else { // "gamma" 或默认
+        config.search_method = SearchMethod::DYNAMIC_GAMMA;
+    }
     // Set distance counting based on command line flag
     config.count_distance_computation = args.count_dist;
+
+    auto log_build_cfg = [&]() {
+        std::cerr << "[CONFIG] "
+                  << "multilayer=" << (config.enable_multilayer ? 1 : 0)
+                  << " onng=" << (config.enable_onng ? 1 : 0)
+                  << " bfs=" << (config.enable_bfs ? 1 : 0)
+                  << " simd=" << (config.enable_simd ? 1 : 0)
+                  << " neg_ip=" << (config.use_negative_inner_product ? 1 : 0)
+                  << " M=" << config.M
+                  << " efC=" << config.ef_construction
+                  << " oo=" << config.onng_out_degree
+                  << " oi=" << config.onng_in_degree
+                  << " om=" << config.onng_min_edges
+                  << " cache=" << args.cache_path
+                  << "\n";
+    };
+    auto log_search_cfg = [&]() {
+        std::cerr << "[SEARCH] strategy=" << args.strategy
+                  << " gamma=" << args.gamma
+                  << " ef=" << args.ef_search
+                  << " k=" << args.k
+                  << " count_dist=" << (args.count_dist ? 1 : 0)
+                  << "\n";
+    };
+    log_build_cfg();
+    if (!args.opt_only) log_search_cfg();
     
     Solution solution;
     double build_ms = 0.0;
@@ -459,8 +544,8 @@ int main(int argc, char** argv) {
     if (!args.cache_path.empty() && file_exists(args.cache_path)) {
         // Try to load from cache
         auto load_start = std::chrono::high_resolution_clock::now();
-        if (Solution::isGraphCacheValid(args.cache_path, args.dim, args.base_count)) {
-            if (solution.loadGraph(args.cache_path)) {
+        if (Solution::isGraphCacheValid(args.cache_path, args.dim, args.base_count, config.enable_multilayer)) {
+            if (solution.loadGraph(args.cache_path, config.enable_multilayer)) {
                 loaded_from_cache = true;
                 solution.setConfig(config);  // Apply search config
                 auto load_end = std::chrono::high_resolution_clock::now();
@@ -476,6 +561,10 @@ int main(int argc, char** argv) {
     
     // Build if not loaded from cache
     if (!loaded_from_cache) {
+        if (args.opt_only) {
+            std::cerr << "[AblationRunner] --opt-only requires a valid input cache. Rebuild is not performed.\n";
+            return 1;
+        }
         auto build_start = std::chrono::high_resolution_clock::now();
         solution.buildWithConfig(args.dim, base_data, config);
         auto build_end = std::chrono::high_resolution_clock::now();
@@ -489,6 +578,33 @@ int main(int argc, char** argv) {
             }
         }
     }
+
+    // 如果仅做优化并退出
+    if (args.opt_only) {
+        // 按顺序执行 ONNG / BFS
+        if (args.opt_order == "bfs-first") {
+            if (config.enable_bfs) solution.applyBFSReorder();
+            if (config.enable_onng) solution.optimizeGraphDirectly(false, config.onng_out_degree, config.onng_in_degree, config.onng_min_edges);
+        } else { // 默认 onng-first
+            if (config.enable_onng) solution.optimizeGraphDirectly(false, config.onng_out_degree, config.onng_in_degree, config.onng_min_edges);
+            if (config.enable_bfs) solution.applyBFSReorder();
+        }
+
+        std::string out_path = args.cache_out.empty() ? args.cache_path : args.cache_out;
+        if (out_path.empty()) {
+            std::cerr << "[AblationRunner] No output cache path specified.\n";
+            return 1;
+        }
+        if (!solution.saveGraph(out_path)) {
+            std::cerr << "[AblationRunner] Failed to save optimized cache.\n";
+            return 1;
+        }
+        std::cerr << "[AblationRunner] Optimized graph saved to: " << out_path << "\n";
+        if (log_file) {
+            std::cerr.rdbuf(cerr_buf);
+        }
+        return 0;
+    }
     
     // Prepare result storage
     std::vector<std::vector<int>> predictions(args.query_count, std::vector<int>(args.k, -1));
@@ -498,6 +614,13 @@ int main(int argc, char** argv) {
     
     // ==================== Run Search ====================
     auto search_start = std::chrono::high_resolution_clock::now();
+    std::cerr << "[SEARCH] start strategy=" << args.strategy
+              << " gamma=" << args.gamma
+              << " ef=" << args.ef_search
+              << " k=" << args.k
+              << " queries=" << args.query_count
+              << " cache=" << args.cache_path
+              << "\n";
     for (size_t i = 0; i < args.query_count; ++i) {
         solution.searchWithK(queries[i], predictions[i].data(), args.k);
     }
@@ -522,6 +645,9 @@ int main(int argc, char** argv) {
     // ==================== Output JSON ====================
     output_json(args, build_ms, search_ms, qps, recall, avg_dist_calcs);
     
+    if (log_file) {
+        std::cerr.rdbuf(cerr_buf);
+    }
     return 0;
 }
 
