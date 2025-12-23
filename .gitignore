@@ -10,6 +10,10 @@ query*.bin
 
 // 答案文件
 ans*.txt
+experiment_result*
+graph.bin
+graphs.bin
+vis_paths*.json
 
 
 // 可执行文件
