@@ -6,7 +6,9 @@ experiment 分支聚焦于**消融实验/批量实验**，用于系统性评估 
 
 - **`runner.exe`（`AblationRunner.cpp`）**：消融实验 CLI，输出单行 JSON（供脚本解析）
 - **`run_experiments.py`**：批量运行实验（支持断点续跑），输出 `experiment_results.pkl/csv`
-- **`clean_experiments.py`**：按条件删除 pkl 中部分结果，实现“只重跑某几组且不影响其他结果”
+- **`clean_experiments.py`**：按条件删除 pkl 中部分结果，实现"只重跑某几组且不影响其他结果"
+- **`plot_analysis.py`**：实验结果分析可视化，生成多维度图表到 `analysis_plots/`
+- **`visualize_search.py`**：搜索路径可视化工具，生成图结构与路径轨迹图
 
 > 只想跑主程序/对拍工具请参考 main 分支的文档
 
@@ -16,11 +18,15 @@ experiment 分支聚焦于**消融实验/批量实验**，用于系统性评估 
 
 - **C++17**，且 `<thread>/<mutex>` 可用（GCC/Clang/MSVC 均可）
 - **Windows + MinGW-w64**：建议使用 **POSIX 线程变体**，并确保命令带 `-pthread`
-- **Python**：3.7+（脚本仅使用标准库）
+- **Python**：3.7+
+  - 实验脚本（`run_experiments.py`、`clean_experiments.py`）：仅使用标准库
+  - 可视化脚本：需安装 `pip install numpy matplotlib pandas scikit-learn`（可选 `ijson` 用于大文件流式解析）
 
 ---
 
 ## 项目结构（experiment 分支）
+
+### 核心文件
 
 | 文件 | 说明 |
 |---|---|
@@ -31,6 +37,22 @@ experiment 分支聚焦于**消融实验/批量实验**，用于系统性评估 
 | `BinaryIO.h` | `.bin` 向量文件读写（header-only，magic 为 `VECBIN1\0`） |
 | `Config.h` | 数据集路径、默认 query/ans 路径（供 main/checker 使用） |
 | `main.cpp` / `checker.cpp` | 主程序/对拍工具（实验前可用于生成 ground-truth 或 sanity check） |
+
+### 数据分析与可视化脚本
+
+| 文件 | 说明 |
+|---|---|
+| `plot_analysis.py` | 实验结果分析可视化（生成 Recall/QPS、M/efC 影响、模块消融等图表） |
+| `compare_strategies.py` | 搜索策略分歧点对比分析（比较不同策略访问节点顺序的差异） |
+| `visualize_search.py` | HNSW 图结构和搜索路径可视化工具（支持完整模式与轻量模式） |
+
+### 输出目录
+
+| 目录 | 说明 |
+|---|---|
+| `analysis_plots/` | `plot_analysis.py` 生成的分析图表（fig01~fig13） |
+| `output/` | `visualize_search.py` 生成的搜索路径可视化图 |
+| `vis_paths*.json` | runner 导出的搜索路径记录（供可视化脚本使用） |
 
 ---
 
@@ -198,6 +220,92 @@ python clean_experiments.py --expr "r.group_name.startswith('11110_') and r.reca
 
 ---
 
+## 数据分析与可视化
+
+### 1）实验结果分析：`plot_analysis.py`
+
+对 `experiment_results.csv` 进行多维度分析并生成图表：
+
+```bash
+python plot_analysis.py
+```
+
+**生成的图表**（保存到 `analysis_plots/`）：
+
+| 图表 | 内容 |
+|---|---|
+| `fig01_strategy_recall_qps.png` | 不同搜索策略的 Recall-QPS 曲线 |
+| `fig02_module_ablation_recall_qps.png` | 模块消融对 Recall-QPS 的影响 |
+| `fig03_M_impact_recall_qps.png` | M 参数对 Recall-QPS 的影响 |
+| `fig04_efC_impact_recall_qps.png` | efC 参数对 Recall-QPS 的影响 |
+| `fig05_M_efC_heatmap.png` | M 与 efC 组合的热力图 |
+| `fig06_dist_calcs_vs_qps.png` | 距离计算次数 vs QPS |
+| `fig07_dist_calcs_vs_recall.png` | 距离计算次数 vs Recall |
+| `fig08_module_qps_improvement.png` | 各模块的 QPS 提升率 |
+| `fig09_strategy_qps_comparison.png` | 策略间 QPS 对比 |
+| `fig10_strategy_improvement_matrix.png` | 策略提升矩阵 |
+| `fig11_params_for_target_recall.png` | 达成目标召回率所需参数 |
+| `fig12_params_by_module.png` | 按模块分析参数影响 |
+| `fig13_param_recall_summary_table.png` | 参数与召回率汇总表 |
+
+### 2）策略分歧点对比：`compare_strategies.py`
+
+比较两个搜索策略在访问节点顺序上的分歧点：
+
+```bash
+# 对比两个策略的搜索路径（位置参数）
+python compare_strategies.py vis_paths.json vis_paths_fix.json
+
+# 限制分析的查询数量
+python compare_strategies.py vis_paths.json vis_paths_fix.json --max-queries 100
+
+# 指定输出路径和策略名称
+python compare_strategies.py vis_paths.json vis_paths_fix.json --name1 Gamma --name2 FixedEF -o output/divergence.png
+```
+
+**输出**：分歧点统计和可视化图（默认保存到当前目录 `strategy_divergence.png`）
+
+> 依赖：推荐安装 `ijson`（`pip install ijson`）用于流式解析大 JSON 文件，避免内存问题。
+
+### 3）搜索路径可视化：`visualize_search.py`
+
+可视化 HNSW 图结构和搜索路径，支持两种模式：
+
+**完整模式**（需要 graph.json，内存占用大）：
+
+```bash
+python visualize_search.py --graph graph.json --paths vis_paths.json --samples 30 -o output/hnsw
+```
+
+**轻量模式**（只需 paths.json，内存占用小，适合大图）：
+
+```bash
+python visualize_search.py --paths vis_paths.json --light --samples 100 -o output/hnsw_light
+```
+
+**输出内容**：
+- 图结构的 2D 降维可视化
+- 搜索路径轨迹（显示距离下降过程）
+- 路径长度分布直方图
+- 改进点标注
+
+**依赖**：
+
+```bash
+pip install numpy matplotlib scikit-learn
+```
+
+### 4）生成搜索路径文件
+
+runner 可通过 `--vis-paths` 参数导出搜索路径供可视化使用：
+
+```bash
+./runner.exe --data=data_o/glove/base.bin --query=query0.bin --groundtruth=ansglove.txt \
+    --strategy=gamma --gamma=1.2 --vis-paths=vis_paths.json
+```
+
+---
+
 ## 常见问题
 
 - **Windows + MinGW-w64**：务必使用 POSIX 线程变体并带 `-pthread`，否则多线程/链接容易踩坑
@@ -205,7 +313,7 @@ python clean_experiments.py --expr "r.group_name.startswith('11110_') and r.reca
 - **结果不更新**：删了 `experiment_results.csv` 但没删 `experiment_results.pkl` → 脚本仍会跳过已完成任务
 - **缓存污染**：清理顺序建议：
   1. 结果逻辑错：先用 `clean_experiments.py` 清理 `experiment_results.pkl`
-  2. 构图逻辑改动或怀疑复用旧图：清理 `I:\graph_cache`（实验缓存）
+  2. 构图逻辑改动或怀疑复用旧图：清理实验缓存
 
 ---
 
@@ -219,6 +327,14 @@ g++ -std=c++17 -O2 -pthread -o runner.exe AblationRunner.cpp MySolution.cpp Brut
 
 # 3) 跑实验（断点续跑）
 python run_experiments.py
+
+# 4) 分析实验结果（生成图表到 analysis_plots/）
+python plot_analysis.py
+
+# 5) [可选] 可视化搜索路径
+./runner.exe --data=data_o/glove/base.bin --query=query0.bin --groundtruth=ansglove.txt \
+    --strategy=gamma --gamma=1.2 --vis-paths=vis_paths.json
+python visualize_search.py --paths vis_paths.json --light --samples 50 -o output/search_vis
 ```
 
 
