@@ -1,5 +1,9 @@
 # DataStructure（experiment）：HNSW/ONNG/BFS/SIMD 近邻搜索 + 消融实验
 
+## 项目概述
+
+本项目实现了基于图的近似最近邻（ANN）搜索算法，用于在高维向量空间中快速查找 K 个最近邻。核心实现包括 HNSW 分层图、ONNG 边优化、BFS 内存重排和 SIMD 向量化加速，支持 GloVe/SIFT 等标准数据集的评测。
+
 experiment 分支聚焦于**消融实验/批量实验**，用于系统性评估 ONNG/BFS/SIMD/单层/负内积与搜索策略（gamma / gamma-static / fixed-ef）对性能与召回的影响。
 
 当前入口：
@@ -11,6 +15,67 @@ experiment 分支聚焦于**消融实验/批量实验**，用于系统性评估 
 - **`visualize_search.py`**：搜索路径可视化工具，生成图结构与路径轨迹图
 
 > 只想跑主程序/对拍工具请参考 main 分支的文档
+
+---
+
+## 算法实现
+
+| 算法                     | 说明                                                       | 位置             |
+| ------------------------ | ---------------------------------------------------------- | ---------------- |
+| **HNSW**           | 分层可导航小世界图（Hierarchical Navigable Small World）   | `MySolution.h` |
+| **ONNG**           | 优化导航近邻图（Optimized Navigable Neighbor Graph）边裁剪 | `MySolution.h` |
+| **BFS 重排**       | 基于 BFS 的节点内存布局优化，提升缓存命中率                | `MySolution.h` |
+| **SIMD**           | 向量化距离计算（SSE/AVX/AVX512 自动检测）                  | `MySolution.h` |
+| **Adaptive Gamma** | 自适应搜索策略，动态调整终止阈值                           | `MySolution.h` |
+| **Brute Force**    | 暴力精确搜索基线（O(n)）                                   | `Brute.h/.cpp` |
+
+### 实现说明
+
+- **HNSW**：多层跳表结构，上层稀疏用于快速定位，底层稠密保证召回
+- **ONNG**：在单层图基础上进行边裁剪，减少冗余边以提升搜索效率
+- **BFS 重排**：将图节点按 BFS 顺序重新排列，使相邻访问的节点在内存中连续
+- **SIMD**：支持 SSE、AVX、AVX-512 指令集，x86/x64 平台自动启用
+
+---
+
+## 数据集
+
+| 数据集          | 向量数量  | 维度 | 查询数量 | 说明                  |
+| --------------- | --------- | ---- | -------- | --------------------- |
+| **GloVe** | 1,183,514 | 100  | 10,000   | 词向量数据集，L2 距离 |
+| **SIFT**  | 1,000,000 | 128  | 10,000   | 图像特征数据集        |
+| **Test**  | 10        | 10   | -        | 调试用小数据集        |
+
+> **注意**：仓库中仅包含 `.bin` 二进制格式文件。`.txt` 文本格式因体积较大（约 800MB）未包含。
+
+---
+
+## 性能结果
+
+### GloVe 数据集（1.18M 向量，100 维，10K 查询）
+
+| 方法                     | 搜索延迟 (ms/q) | Recall@10 | 状态 |
+| ------------------------ | --------------- | --------- | ---- |
+| Brute Force              | -               | 100.00%   | 基线 |
+| HNSW + ONNG + BFS + SIMD | 0.25            | ≥99%     | ✓   |
+
+### SIFT 数据集（1M 向量，128 维，10K 查询）
+
+| 方法                     | 搜索延迟 (ms/q) | Recall@10 | 状态 |
+| ------------------------ | --------------- | --------- | ---- |
+| Brute Force              | -               | 100.00%   | 基线 |
+| HNSW + ONNG + BFS + SIMD | 1.51            | ≥99%     | ✓   |
+
+---
+
+## 测试环境
+
+| 项目               | 配置                                           |
+| ------------------ | ---------------------------------------------- |
+| **CPU**      | AMD Ryzen 9 7945HX with Radeon Graphics 十六核 |
+| **内存**     | 三星 16GB DDR5 5200MHz                         |
+| **操作系统** | Windows                                        |
+| **编译器**   | GCC（C++17）                                   |
 
 ---
 
@@ -26,33 +91,50 @@ experiment 分支聚焦于**消融实验/批量实验**，用于系统性评估 
 
 ## 项目结构（experiment 分支）
 
+```
+.
+├── AblationRunner.cpp    # 消融实验 CLI
+├── run_experiments.py    # 批量实验脚本
+├── clean_experiments.py  # 结果清理工具
+├── plot_analysis.py      # 实验结果分析可视化
+├── compare_strategies.py # 策略分歧点对比
+├── visualize_search.py   # 搜索路径可视化
+├── MySolution.h/.cpp     # HNSW + ONNG + BFS + SIMD 实现
+├── Brute.h/.cpp          # 暴力解基线
+├── BinaryIO.h            # 二进制向量文件读写
+├── Config.h              # 配置文件
+├── main.cpp / checker.cpp # 主程序/对拍工具
+├── analysis_plots/       # 分析图表输出目录
+└── output/               # 可视化输出目录
+```
+
 ### 核心文件
 
-| 文件 | 说明 |
-|---|---|
-| `AblationRunner.cpp` | 消融实验 CLI（参数化 build/search，输出 JSON） |
-| `run_experiments.py` | 批量实验脚本（断点续跑、参数 sweep、导出 CSV） |
-| `clean_experiments.py` | 按条件清理 `experiment_results.pkl` 并重导出 CSV |
-| `MySolution.h/.cpp` | HNSW + ONNG + BFS 重排 + SIMD 实现（含 `SolutionConfig`） |
-| `BinaryIO.h` | `.bin` 向量文件读写（header-only，magic 为 `VECBIN1\0`） |
-| `Config.h` | 数据集路径、默认 query/ans 路径（供 main/checker 使用） |
+| 文件                           | 说明                                                             |
+| ------------------------------ | ---------------------------------------------------------------- |
+| `AblationRunner.cpp`         | 消融实验 CLI（参数化 build/search，输出 JSON）                   |
+| `run_experiments.py`         | 批量实验脚本（断点续跑、参数 sweep、导出 CSV）                   |
+| `clean_experiments.py`       | 按条件清理 `experiment_results.pkl` 并重导出 CSV               |
+| `MySolution.h/.cpp`          | HNSW + ONNG + BFS 重排 + SIMD 实现（含 `SolutionConfig`）      |
+| `BinaryIO.h`                 | `.bin` 向量文件读写（header-only，magic 为 `VECBIN1\0`）     |
+| `Config.h`                   | 数据集路径、默认 query/ans 路径（供 main/checker 使用）          |
 | `main.cpp` / `checker.cpp` | 主程序/对拍工具（实验前可用于生成 ground-truth 或 sanity check） |
 
 ### 数据分析与可视化脚本
 
-| 文件 | 说明 |
-|---|---|
-| `plot_analysis.py` | 实验结果分析可视化（生成 Recall/QPS、M/efC 影响、模块消融等图表） |
-| `compare_strategies.py` | 搜索策略分歧点对比分析（比较不同策略访问节点顺序的差异） |
-| `visualize_search.py` | HNSW 图结构和搜索路径可视化工具（支持完整模式与轻量模式） |
+| 文件                      | 说明                                                              |
+| ------------------------- | ----------------------------------------------------------------- |
+| `plot_analysis.py`      | 实验结果分析可视化（生成 Recall/QPS、M/efC 影响、模块消融等图表） |
+| `compare_strategies.py` | 搜索策略分歧点对比分析（比较不同策略访问节点顺序的差异）          |
+| `visualize_search.py`   | HNSW 图结构和搜索路径可视化工具（支持完整模式与轻量模式）         |
 
 ### 输出目录
 
-| 目录 | 说明 |
-|---|---|
+| 目录                | 说明                                               |
+| ------------------- | -------------------------------------------------- |
 | `analysis_plots/` | `plot_analysis.py` 生成的分析图表（fig01~fig13） |
-| `output/` | `visualize_search.py` 生成的搜索路径可视化图 |
-| `vis_paths*.json` | runner 导出的搜索路径记录（供可视化脚本使用） |
+| `output/`         | `visualize_search.py` 生成的搜索路径可视化图     |
+| `vis_paths*.json` | runner 导出的搜索路径记录（供可视化脚本使用）      |
 
 ---
 
@@ -77,17 +159,17 @@ experiment 分支聚焦于**消融实验/批量实验**，用于系统性评估 
 
 ## 实验分组：5 位二进制码（`code_bits`）含义
 
-`run_experiments.py` 用一个 **5 位二进制字符串**（例如 `11110`）来表示一组“构图/搜索开关组合”，并据此命名实验组（`group_name`）。
+`run_experiments.py` 用一个 **5 位二进制字符串**（例如 `11110`）来表示一组"构图/搜索开关组合"，并据此命名实验组（`group_name`）。
 
 ### 位序定义（从左到右）
 
-| 位序 | 含义 | `0` | `1` |
-|---|---|---|---|
-| bit0 | `single_layer` | 多层图（multilayer） | **单层图**（等价于 runner 的 `--single-layer`） |
-| bit1 | `onng` | 关闭 ONNG（等价于 `--no-onng`） | **开启 ONNG** |
-| bit2 | `bfs` | 关闭 BFS 重排（等价于 `--no-bfs`） | **开启 BFS 重排** |
-| bit3 | `simd` | 关闭 SIMD（等价于 `--no-simd`） | **开启 SIMD** |
-| bit4 | `neg_ip` | 使用 L2 距离 | **使用负内积**（等价于 `--use-neg-ip`） |
+| 位序 | 含义             | `0`                                | `1`                                                   |
+| ---- | ---------------- | ------------------------------------ | ------------------------------------------------------- |
+| bit0 | `single_layer` | 多层图（multilayer）                 | **单层图**（等价于 runner 的 `--single-layer`） |
+| bit1 | `onng`         | 关闭 ONNG（等价于 `--no-onng`）    | **开启 ONNG**                                     |
+| bit2 | `bfs`          | 关闭 BFS 重排（等价于 `--no-bfs`） | **开启 BFS 重排**                                 |
+| bit3 | `simd`         | 关闭 SIMD（等价于 `--no-simd`）    | **开启 SIMD**                                     |
+| bit4 | `neg_ip`       | 使用 L2 距离                         | **使用负内积**（等价于 `--use-neg-ip`）         |
 
 ### `group_name` 命名规则
 
@@ -108,7 +190,7 @@ experiment 分支聚焦于**消融实验/批量实验**，用于系统性评估 
 
 ### 1）`main/checker`：单文件图缓存（由 `Config.h` 控制）
 
-这套缓存用于“主程序/对拍工具”复用图结构：
+这套缓存用于"主程序/对拍工具"复用图结构：
 
 - `--save-graph[=path]`：构建后保存
 - `--load-graph[=path]`：从缓存加载（跳过构建）
@@ -157,7 +239,7 @@ g++ -std=c++17 -O2 -Wall -Wextra -pthread -o runner.exe AblationRunner.cpp MySol
 
 - **`M`**（`--M=<int>`）：图中每个点的最大连接数（越大通常召回更高但构建更慢/内存更大）
 - **`efC`**（`--efC=<int>`）：构建时的候选队列大小（越大通常图质量更好但构建更慢）
-- **ONNG 参数**（`--onng-out/in/min`）：ONNG 优化相关的出度/入度/最小边数  
+- **ONNG 参数**（`--onng-out/in/min`）：ONNG 优化相关的出度/入度/最小边数
   在 `run_experiments.py` 中，这三个值会根据 `M` 自动派生（避免参数全笛卡尔爆炸）。
 
 ### Search 参数（搜索）
@@ -178,8 +260,8 @@ g++ -std=c++17 -O2 -Wall -Wextra -pthread -o runner.exe AblationRunner.cpp MySol
 ### 缓存与 `opt-only`（脚本如何复用图）
 
 - **`--cache-path=<path>`**：runner 的缓存文件路径（存在就加载；否则构建后写回）
-- **`--opt-only`**：只对已有 cache 做 ONNG/BFS 优化并保存，不执行搜索  
-  `run_experiments.py` 用它把“基础图（无 ONNG/BFS）”逐步变换成目标图（先 ONNG 后 BFS）。
+- **`--opt-only`**：只对已有 cache 做 ONNG/BFS 优化并保存，不执行搜索
+  `run_experiments.py` 用它把"基础图（无 ONNG/BFS）"逐步变换成目标图（先 ONNG 后 BFS）。
 
 ---
 
@@ -194,7 +276,7 @@ python run_experiments.py
 ### 结果文件与断点续跑机制（非常关键）
 
 - `experiment_results.pkl`：**断点续跑与去重唯一依据**（脚本启动时读取它重建 done_keys）
-- `experiment_results.csv`：仅“最终导出表”（脚本结束时重写生成），删它不影响续跑状态
+- `experiment_results.csv`：仅"最终导出表"（脚本结束时重写生成），删它不影响续跑状态
 
 ---
 
@@ -232,21 +314,21 @@ python plot_analysis.py
 
 **生成的图表**（保存到 `analysis_plots/`）：
 
-| 图表 | 内容 |
-|---|---|
-| `fig01_strategy_recall_qps.png` | 不同搜索策略的 Recall-QPS 曲线 |
-| `fig02_module_ablation_recall_qps.png` | 模块消融对 Recall-QPS 的影响 |
-| `fig03_M_impact_recall_qps.png` | M 参数对 Recall-QPS 的影响 |
-| `fig04_efC_impact_recall_qps.png` | efC 参数对 Recall-QPS 的影响 |
-| `fig05_M_efC_heatmap.png` | M 与 efC 组合的热力图 |
-| `fig06_dist_calcs_vs_qps.png` | 距离计算次数 vs QPS |
-| `fig07_dist_calcs_vs_recall.png` | 距离计算次数 vs Recall |
-| `fig08_module_qps_improvement.png` | 各模块的 QPS 提升率 |
-| `fig09_strategy_qps_comparison.png` | 策略间 QPS 对比 |
-| `fig10_strategy_improvement_matrix.png` | 策略提升矩阵 |
-| `fig11_params_for_target_recall.png` | 达成目标召回率所需参数 |
-| `fig12_params_by_module.png` | 按模块分析参数影响 |
-| `fig13_param_recall_summary_table.png` | 参数与召回率汇总表 |
+| 图表                                      | 内容                           |
+| ----------------------------------------- | ------------------------------ |
+| `fig01_strategy_recall_qps.png`         | 不同搜索策略的 Recall-QPS 曲线 |
+| `fig02_module_ablation_recall_qps.png`  | 模块消融对 Recall-QPS 的影响   |
+| `fig03_M_impact_recall_qps.png`         | M 参数对 Recall-QPS 的影响     |
+| `fig04_efC_impact_recall_qps.png`       | efC 参数对 Recall-QPS 的影响   |
+| `fig05_M_efC_heatmap.png`               | M 与 efC 组合的热力图          |
+| `fig06_dist_calcs_vs_qps.png`           | 距离计算次数 vs QPS            |
+| `fig07_dist_calcs_vs_recall.png`        | 距离计算次数 vs Recall         |
+| `fig08_module_qps_improvement.png`      | 各模块的 QPS 提升率            |
+| `fig09_strategy_qps_comparison.png`     | 策略间 QPS 对比                |
+| `fig10_strategy_improvement_matrix.png` | 策略提升矩阵                   |
+| `fig11_params_for_target_recall.png`    | 达成目标召回率所需参数         |
+| `fig12_params_by_module.png`            | 按模块分析参数影响             |
+| `fig13_param_recall_summary_table.png`  | 参数与召回率汇总表             |
 
 ### 2）策略分歧点对比：`compare_strategies.py`
 
@@ -284,6 +366,7 @@ python visualize_search.py --paths vis_paths.json --light --samples 100 -o outpu
 ```
 
 **输出内容**：
+
 - 图结构的 2D 降维可视化
 - 搜索路径轨迹（显示距离下降过程）
 - 路径长度分布直方图
@@ -337,4 +420,62 @@ python plot_analysis.py
 python visualize_search.py --paths vis_paths.json --light --samples 50 -o output/search_vis
 ```
 
+---
 
+## 依赖说明
+
+### C++ 依赖
+
+本项目 C++ 部分仅使用标准库，无需额外第三方依赖：
+
+| 依赖          | 用途              | 说明                                                      |
+| ------------- | ----------------- | --------------------------------------------------------- |
+| C++ 标准库    | 容器、多线程、I/O | `<vector>`, `<thread>`, `<mutex>`, `<fstream>` 等 |
+| SIMD 内建函数 | 向量化距离计算    | `<immintrin.h>`（x86/x64 平台自动可用）                 |
+
+### Python 依赖
+
+| 依赖          | 用途              | 安装命令                     |
+| ------------- | ----------------- | ---------------------------- |
+| numpy         | 数值计算          | `pip install numpy`        |
+| matplotlib    | 图表绑制          | `pip install matplotlib`   |
+| pandas        | 数据分析          | `pip install pandas`       |
+| scikit-learn  | 降维（PCA/t-SNE） | `pip install scikit-learn` |
+| ijson（可选） | 大 JSON 流式解析  | `pip install ijson`        |
+
+---
+
+## 许可证
+
+本项目采用 MIT 许可证 - 详见 [LICENSE](LICENSE) 文件。
+
+```
+MIT License
+
+Copyright (c) 2024
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+---
+
+## 数据集链接
+
+- **GloVe 数据集**：[Stanford NLP](https://nlp.stanford.edu/projects/glove/)
+- **SIFT 数据集**：[Corpus-Texmex](http://corpus-texmex.irisa.fr/)[an - NGT](https://github.com/yahoojapan/NGT)
