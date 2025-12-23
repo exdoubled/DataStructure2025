@@ -3,6 +3,7 @@
 
 // vscode
 .vscode/
+.cursor/
 
 // 查询文件
 query*.txt
@@ -32,9 +33,19 @@ PJ论文/
 data_o/
 
 // 图缓存文件
-graph_cache
+graph.bin
+graphs.bin
+
+vis_paths_s.json
+vis_paths.json
+vis_paths_fix_s.json
+vis_paths_fix.json
+
 
 // 实验结果
 experiment_results.csv*
 experiment_results.pkl*
 __pycache__/
+analysis/
+output/
+analysis_plots/

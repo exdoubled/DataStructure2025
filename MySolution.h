@@ -550,6 +550,179 @@ public:
         query_count_.store(0, memory_order_relaxed);
     }
 
+    // ====================== 搜索路径可视化 =========================
+    // 搜索路径记录：每一步记录 (from_node, to_node, distance, added_to_result)
+    struct SearchPathStep {
+        tableint from_node;      // 源节点（UINT32_MAX 表示入口点/起始）
+        tableint to_node;        // 目标节点
+        dist_t distance;         // 到查询点的距离
+        bool added_to_result;    // 是否加入了结果集
+        
+        static constexpr tableint ENTRY_POINT = UINT32_MAX;  // 入口点标记
+    };
+    
+    struct SearchPathInfo {
+        vector<float> query_vec;           // 查询向量
+        tableint start_entry_point;        // 起始入口点
+        vector<SearchPathStep> steps;      // 搜索步骤
+        vector<tableint> final_results;    // 最终结果（物理ID）
+        vector<tableint> visited_nodes;    // 所有访问过的节点
+    };
+    
+    // 存储最近的搜索路径（用于可视化）
+    mutable vector<SearchPathInfo> recorded_paths_;
+    mutable bool record_paths_enabled_ = false;
+    mutable mutex recorded_paths_mutex_;  // 多线程保护
+    
+    void enablePathRecording(bool enable = true) {
+        record_paths_enabled_ = enable;
+        if (enable) {
+            lock_guard<mutex> lock(recorded_paths_mutex_);
+            recorded_paths_.clear();
+        }
+    }
+    
+    void clearRecordedPaths() {
+        lock_guard<mutex> lock(recorded_paths_mutex_);
+        recorded_paths_.clear();
+    }
+    
+    const vector<SearchPathInfo>& getRecordedPaths() const {
+        return recorded_paths_;
+    }
+    
+    size_t getRecordedPathsCount() const {
+        return recorded_paths_.size();
+    }
+    
+    // 导出图结构到 JSON 文件（用于可视化）
+    // max_nodes: 最多导出多少节点（0表示全部，大图时建议限制）
+    bool exportGraphForVisualization(const string& path, size_t max_nodes = 0) const {
+        size_t node_count = cur_element_count.load(memory_order_acquire);
+        if (node_count == 0) return false;
+        
+        FILE* f = fopen(path.c_str(), "w");
+        if (!f) return false;
+        
+        size_t export_count = (max_nodes > 0 && max_nodes < node_count) ? max_nodes : node_count;
+        
+        fprintf(f, "{\n");
+        fprintf(f, "  \"dim\": %zu,\n", dim_);
+        fprintf(f, "  \"node_count\": %zu,\n", export_count);
+        
+        // 导出向量
+        fprintf(f, "  \"vectors\": [\n");
+        for (size_t i = 0; i < export_count; ++i) {
+            const float* vec = getDataByInternalId(static_cast<tableint>(i));
+            fprintf(f, "    [");
+            for (size_t d = 0; d < dim_; ++d) {
+                fprintf(f, "%.6f%s", vec[d], (d + 1 < dim_) ? ", " : "");
+            }
+            fprintf(f, "]%s\n", (i + 1 < export_count) ? "," : "");
+        }
+        fprintf(f, "  ],\n");
+        
+        // 导出邻接表（第0层）
+        fprintf(f, "  \"adjacency\": [\n");
+        for (size_t i = 0; i < export_count; ++i) {
+            linklistsizeint* ll = getLinkListAtLevel(static_cast<tableint>(i), 0);
+            int size = getListCount(ll);
+            const tableint* neighbors = getNeighborsArray(ll);
+            
+            fprintf(f, "    [");
+            int written = 0;
+            for (int j = 0; j < size; ++j) {
+                if (neighbors[j] < export_count) {
+                    if (written > 0) fprintf(f, ", ");
+                    fprintf(f, "%u", neighbors[j]);
+                    ++written;
+                }
+            }
+            fprintf(f, "]%s\n", (i + 1 < export_count) ? "," : "");
+        }
+        fprintf(f, "  ],\n");
+        
+        // 导出入口点
+        fprintf(f, "  \"entry_points\": [");
+        bool first_ep = true;
+        for (tableint ep : entry_points_) {
+            if (ep < export_count) {
+                if (!first_ep) fprintf(f, ", ");
+                fprintf(f, "%u", ep);
+                first_ep = false;
+            }
+        }
+        fprintf(f, "]\n");
+        
+        fprintf(f, "}\n");
+        fclose(f);
+        
+        cerr << "[exportGraphForVisualization] Exported " << export_count << " nodes to: " << path << "\n";
+        return true;
+    }
+    
+    // 导出搜索路径到 JSON 文件
+    bool exportSearchPaths(const string& path) const {
+        lock_guard<mutex> lock(recorded_paths_mutex_);
+        
+        if (recorded_paths_.empty()) {
+            cerr << "[exportSearchPaths] No recorded paths to export.\n";
+            return false;
+        }
+        
+        FILE* f = fopen(path.c_str(), "w");
+        if (!f) return false;
+        
+        fprintf(f, "[\n");
+        for (size_t pi = 0; pi < recorded_paths_.size(); ++pi) {
+            const auto& p = recorded_paths_[pi];
+            fprintf(f, "  {\n");
+            
+            // 查询向量
+            fprintf(f, "    \"query\": [");
+            for (size_t j = 0; j < p.query_vec.size(); ++j) {
+                fprintf(f, "%.6f%s", p.query_vec[j], j + 1 < p.query_vec.size() ? ", " : "");
+            }
+            fprintf(f, "],\n");
+            
+            // 起始入口点
+            fprintf(f, "    \"start_ep\": %u,\n", p.start_entry_point);
+            
+            // 访问过的节点
+            fprintf(f, "    \"visited\": [");
+            for (size_t j = 0; j < p.visited_nodes.size(); ++j) {
+                fprintf(f, "%u%s", p.visited_nodes[j], j + 1 < p.visited_nodes.size() ? ", " : "");
+            }
+            fprintf(f, "],\n");
+            
+            // 搜索步骤
+            fprintf(f, "    \"steps\": [\n");
+            for (size_t si = 0; si < p.steps.size(); ++si) {
+                const auto& s = p.steps[si];
+                fprintf(f, "      {\"from\": %d, \"to\": %u, \"dist\": %.6f, \"added\": %s}%s\n",
+                        (s.from_node == SearchPathStep::ENTRY_POINT) ? -1 : static_cast<int>(s.from_node),
+                        s.to_node, s.distance,
+                        s.added_to_result ? "true" : "false",
+                        si + 1 < p.steps.size() ? "," : "");
+            }
+            fprintf(f, "    ],\n");
+            
+            // 最终结果
+            fprintf(f, "    \"results\": [");
+            for (size_t j = 0; j < p.final_results.size(); ++j) {
+                fprintf(f, "%u%s", p.final_results[j], j + 1 < p.final_results.size() ? ", " : "");
+            }
+            fprintf(f, "]\n");
+            
+            fprintf(f, "  }%s\n", pi + 1 < recorded_paths_.size() ? "," : "");
+        }
+        fprintf(f, "]\n");
+        fclose(f);
+        
+        cerr << "[exportSearchPaths] Exported " << recorded_paths_.size() << " search paths to: " << path << "\n";
+        return true;
+    }
+
     // ====================== 随机多入口点 =========================
     void initRandomEpoints() {
         entry_points_.clear();
@@ -1107,7 +1280,7 @@ public:
             int size = getListCount(ll);
             const tableint* data = getNeighborsArray(ll);
             for (int i = 0; i < size; ++i) {
-                _mm_prefetch(getDataByInternalId(data[i]), _MM_HINT_T0);
+                _mm_prefetch(reinterpret_cast<const char*>(getDataByInternalId(data[i])), _MM_HINT_T0);
             }
 
             for (int i = 0; i < size; ++i) {
@@ -1120,6 +1293,101 @@ public:
                     top_candidates.emplace(d, candidateID);
                     if (top_candidates.size() > ef_limit) top_candidates.pop();
                     lowerBound = top_candidates.top().first;
+                }
+            }
+        }
+        return top_candidates;
+    }
+
+    // 带路径记录的搜索层函数（用于可视化）
+    MaxHeap4 searchLayerWithRecording(
+        tableint ep_id,
+        const float *query,
+        int layer,
+        size_t ef_limit,
+        bool recording,
+        SearchPathInfo& path_info) const {
+        MaxHeap4 top_candidates;
+        MaxHeap4 candidate_set;
+
+        dist_t dist = L2Distance(query, getDataByInternalId(ep_id));
+        top_candidates.emplace(dist, ep_id);
+        candidate_set.emplace(-dist, ep_id);
+
+        dist_t lowerBound = dist;
+
+        thread_local vector<uint64_t> visit_bitmap_tls;
+        thread_local vector<uint32_t> visit_epoch_tls;
+        thread_local uint32_t visit_token_tls = 1u;
+
+        const size_t needed_words = (max_elements_ + 63ull) >> 6;
+        if (visit_bitmap_tls.size() < needed_words) {
+            visit_bitmap_tls.assign(needed_words, 0ull);
+            visit_epoch_tls.assign(needed_words, 0u);
+        } else if (visit_epoch_tls.size() < visit_bitmap_tls.size()) {
+            visit_epoch_tls.resize(visit_bitmap_tls.size(), 0u);
+        }
+
+        visit_token_tls += 1u;
+        if (visit_token_tls == 0u) {
+            fill(visit_epoch_tls.begin(), visit_epoch_tls.end(), 0u);
+            visit_token_tls = 1u;
+        }
+        auto touch_word = [&](size_t word_idx) {
+            if (visit_epoch_tls[word_idx] != visit_token_tls) {
+                visit_epoch_tls[word_idx] = visit_token_tls;
+                visit_bitmap_tls[word_idx] = 0ull;
+            }
+        };
+        auto is_visited = [&](tableint id) -> bool {
+            size_t word = static_cast<size_t>(id) >> 6;
+            size_t bit = static_cast<size_t>(id) & 63ull;
+            touch_word(word);
+            return (visit_bitmap_tls[word] >> bit) & 1ull;
+        };
+        auto mark_visited = [&](tableint id) {
+            size_t word = static_cast<size_t>(id) >> 6;
+            size_t bit = static_cast<size_t>(id) & 63ull;
+            touch_word(word);
+            visit_bitmap_tls[word] |= (1ull << bit);
+        };
+
+        mark_visited(ep_id);
+
+        while (!candidate_set.empty()) {
+            auto currPair = candidate_set.top();
+            
+            if ((-currPair.first) > lowerBound && top_candidates.size() == ef_limit) break;
+
+            candidate_set.pop();
+            tableint curID = currPair.second;
+
+            linklistsizeint* ll = getLinkListAtLevel(curID, layer);
+            int size = getListCount(ll);
+            const tableint* data = getNeighborsArray(ll);
+            for (int i = 0; i < size; ++i) {
+                _mm_prefetch(reinterpret_cast<const char*>(getDataByInternalId(data[i])), _MM_HINT_T0);
+            }
+
+            for (int i = 0; i < size; ++i) {
+                tableint candidateID = data[i];
+                if (is_visited(candidateID)) continue;
+                mark_visited(candidateID);
+                dist_t d = L2Distance(query, getDataByInternalId(candidateID));
+                
+                bool added = false;
+                if (top_candidates.size() < ef_limit || d < lowerBound) {
+                    candidate_set.emplace(-d, candidateID);
+                    top_candidates.emplace(d, candidateID);
+                    added = true;
+                    if (top_candidates.size() > ef_limit) top_candidates.pop();
+                    lowerBound = top_candidates.top().first;
+                }
+
+                // 记录路径
+                if (recording) {
+                    path_info.visited_nodes.push_back(candidateID);
+                    path_info.steps.push_back({curID, candidateID, d, added});
                 }
             }
         }
@@ -1670,10 +1938,25 @@ private:
         if (node_count == 0) return;
         ef = max(ef, k);
 
+        // 路径记录相关
+        const bool recording = record_paths_enabled_;
+        SearchPathInfo path_info;
+        if (recording) {
+            path_info.query_vec.assign(query, query + dim_);
+        }
+
         tableint currObj = enterpoint_node_.load(memory_order_acquire);
         if (currObj == static_cast<tableint>(-1) || currObj >= node_count) currObj = 0;
 
         dist_t curdist = L2Distance(query, getDataByInternalId(currObj));
+        
+        // 记录入口点
+        if (recording) {
+            path_info.start_entry_point = currObj;
+            path_info.visited_nodes.push_back(currObj);
+            path_info.steps.push_back({SearchPathStep::ENTRY_POINT, currObj, curdist, true});
+        }
+
         vector<tableint> neighbors;
         neighbors.reserve(maxM0_);
 
@@ -1682,9 +1965,14 @@ private:
             bool changed = true;
             while (changed) {
                 changed = false;
+                tableint prevObj = currObj;
                 collectNeighborsLockFree(currObj, level, neighbors);
                 for (tableint cand : neighbors) {
                     dist_t d = L2Distance(query, getDataByInternalId(cand));
+                    if (recording) {
+                        path_info.visited_nodes.push_back(cand);
+                        path_info.steps.push_back({prevObj, cand, d, false});
+                    }
                     if (d < curdist) {
                         curdist = d;
                         currObj = cand;
@@ -1694,7 +1982,7 @@ private:
             }
         }
 
-        MaxHeap4 top_candidates = searchLayer(currObj, query, 0, ef);
+        MaxHeap4 top_candidates = searchLayerWithRecording(currObj, query, 0, ef, recording, path_info);
 
         // 输出排序后的前 k 个
         vector<distPair> buf;
@@ -1706,12 +1994,21 @@ private:
         sort(buf.begin(), buf.end(), [](const distPair& a, const distPair& b) { return a.first < b.first; });
 
         size_t out = min(k, buf.size());
+        vector<tableint> final_results_physical;
         for (size_t i = 0; i < out; ++i) {
             tableint physical_id = buf[i].second;
             tableint logical_id = (physical_id < physical_to_logical_.size()) ? physical_to_logical_[physical_id] : physical_id;
             res[i] = static_cast<int>(logical_id);
+            final_results_physical.push_back(physical_id);
         }
         for (size_t i = out; i < k; ++i) res[i] = -1;
+
+        // 保存路径记录
+        if (recording) {
+            path_info.final_results = final_results_physical;
+            lock_guard<mutex> lock(recorded_paths_mutex_);
+            recorded_paths_.push_back(std::move(path_info));
+        }
     }
 
     // 搜索 k 个最近邻，结果直接写入 res 数组
@@ -1724,6 +2021,13 @@ private:
         const size_t k = 10;
         const float max_gamma = dynamic_gamma ? gamma * 1.1f : gamma;
         const float min_gamma = dynamic_gamma ? gamma * 0.995f : gamma;
+
+        // 路径记录相关
+        const bool recording = record_paths_enabled_;
+        SearchPathInfo path_info;
+        if (recording) {
+            path_info.query_vec.assign(query, query + dim_);
+        }
 
         MaxHeap4 top_candidates;
         MaxHeap4 candidate_set;
@@ -1773,6 +2077,13 @@ private:
 
         dist_t curdist = L2Distance(query, getDataByInternalId(currObj));
 
+        // 记录入口点
+        if (recording) {
+            path_info.start_entry_point = currObj;
+            path_info.visited_nodes.push_back(currObj);
+            path_info.steps.push_back({SearchPathStep::ENTRY_POINT, currObj, curdist, true});
+        }
+
         vector<tableint> neighbors;
         neighbors.reserve(maxM0_);
 
@@ -1781,9 +2092,14 @@ private:
             bool changed = true;
             while (changed) {
                 changed = false;
+                tableint prevObj = currObj;
                 collectNeighborsLockFree(currObj, level, neighbors);
                 for (tableint cand : neighbors) {
                     dist_t d = L2Distance(query, getDataByInternalId(cand));
+                    if (recording) {
+                        path_info.visited_nodes.push_back(cand);
+                        path_info.steps.push_back({prevObj, cand, d, false});
+                    }
                     if (d < curdist) {
                         curdist = d;
                         currObj = cand;
@@ -1846,18 +2162,38 @@ private:
                         top_candidates.pop();
                     }
                 }
+                
+                // 记录是否加入了候选探索队列
+                bool added_to_candidate = false;
                 if (top_candidates.size() < k || d < (1.0f + current_gamma) * top_candidates.top().first) {
                     candidate_set.emplace(-d, e);
+                    added_to_candidate = true;
+                }
+
+                // 记录搜索步骤
+                if (recording) {
+                    path_info.visited_nodes.push_back(e);
+                    path_info.steps.push_back({cid, e, d, added_to_candidate});
                 }
             }
         }
 
+        // 收集最终结果
+        vector<tableint> final_results_physical;
         int curid = static_cast<int>(k);
         while (!top_candidates.empty() && curid > 0) {
             tableint physical_id = top_candidates.top().second;
             tableint logical_id = (physical_id < physical_to_logical_.size()) ? physical_to_logical_[physical_id] : physical_id;
             res[--curid] = static_cast<int>(logical_id);
+            final_results_physical.push_back(physical_id);
             top_candidates.pop();
+        }
+
+        // 保存路径记录
+        if (recording) {
+            path_info.final_results = final_results_physical;
+            lock_guard<mutex> lock(recorded_paths_mutex_);
+            recorded_paths_.push_back(std::move(path_info));
         }
     }
 

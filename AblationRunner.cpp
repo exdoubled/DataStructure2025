@@ -80,10 +80,16 @@ struct AblationArgs {
     size_t k = 10;
     std::string strategy = "gamma";  // "gamma" (dynamic), "gamma-static", "fixed"
     float gamma = 0.19f;
-    size_t ef_search = 100;
+    size_t ef_search = 704;
     
     // Debug params
     bool count_dist = false;  // If true, count distance computations (slower)
+    
+    // Visualization params
+    std::string vis_graph_path;   // 导出图结构JSON路径（可选）
+    std::string vis_paths_path;   // 导出搜索路径JSON路径（可选）
+    size_t vis_samples = 100;     // 采样多少个查询的搜索路径（0=全部）
+    size_t vis_max_nodes = 0;     // 导出图结构时最多导出多少节点（0=全部）
     
     // Derived
     int dim = 0;
@@ -123,7 +129,7 @@ Build Options:
   --single-layer       Disable multi-layer graph (use single-layer)
   --use-neg-ip         Use negative inner product instead of L2
   --opt-only           Load cache, apply ONNG/BFS, save, and exit (no search)
-  --cache-out=<path>   Output cache path when --opt-only is used (default: overwrite cache-path)
+  --cache-out=<path>   Output cache path (after search, or when --opt-only is used)
   --opt-order=<s>      "onng-first" (default) or "bfs-first" when both are enabled
   --log-to-file        Write stderr/logs to a file next to cache (cache-path + ".log")
 
@@ -135,6 +141,12 @@ Search Options:
 
 Debug Options:
   --count-dist         Count distance computations (slower)
+
+Visualization Options:
+  --vis-graph=<path>   Export graph structure to JSON file (for visualize_search.py)
+  --vis-paths=<path>   Export search paths to JSON file (for visualize_search.py)
+  --vis-samples=<int>  Number of queries to record paths for (default: 100, 0=all)
+  --vis-max-nodes=<n>  Max nodes to export in graph JSON (default: 0=all)
 )";
 }
 
@@ -195,6 +207,16 @@ static bool parse_args(int argc, char** argv, AblationArgs& args) {
         // Debug
         else if (arg == "--count-dist") {
             args.count_dist = true;
+        }
+        // Visualization
+        else if (arg.rfind("--vis-graph=", 0) == 0) {
+            args.vis_graph_path = arg.substr(12);
+        } else if (arg.rfind("--vis-paths=", 0) == 0) {
+            args.vis_paths_path = arg.substr(12);
+        } else if (arg.rfind("--vis-samples=", 0) == 0) {
+            args.vis_samples = std::max(0, std::atoi(arg.substr(14).c_str()));
+        } else if (arg.rfind("--vis-max-nodes=", 0) == 0) {
+            args.vis_max_nodes = std::max(0, std::atoi(arg.substr(16).c_str()));
         }
         else if (arg == "--help" || arg == "-h") {
             print_usage();
@@ -612,6 +634,18 @@ int main(int argc, char** argv) {
     // Reset distance stats before search
     solution.resetDistanceStats();
     
+    // ==================== Visualization Setup ====================
+    bool enable_vis_recording = !args.vis_paths_path.empty();
+    size_t vis_sample_count = (args.vis_samples == 0 || args.vis_samples > args.query_count) 
+                              ? args.query_count : args.vis_samples;
+    
+    if (enable_vis_recording) {
+        solution.clearRecordedPaths();  // 清空之前的路径记录
+        solution.enablePathRecording(true);
+        std::cerr << "[VIS] Path recording enabled for " << vis_sample_count << " queries\n";
+        std::cerr << "[VIS] Strategy: " << args.strategy << ", Output: " << args.vis_paths_path << "\n";
+    }
+    
     // ==================== Run Search ====================
     auto search_start = std::chrono::high_resolution_clock::now();
     std::cerr << "[SEARCH] start strategy=" << args.strategy
@@ -622,9 +656,17 @@ int main(int argc, char** argv) {
               << " cache=" << args.cache_path
               << "\n";
     for (size_t i = 0; i < args.query_count; ++i) {
+        // 只对采样的查询记录路径
+        if (enable_vis_recording && i >= vis_sample_count) {
+            solution.enablePathRecording(false);
+            enable_vis_recording = false;  // 不再重复禁用
+        }
         solution.searchWithK(queries[i], predictions[i].data(), args.k);
     }
     auto search_end = std::chrono::high_resolution_clock::now();
+    
+    // 禁用路径记录
+    solution.enablePathRecording(false);
     
     double search_ms = std::chrono::duration<double>(search_end - search_start).count() * 1000.0;
     double qps = (search_ms > 0) ? ((double)args.query_count / (search_ms / 1000.0)) : 0.0;
@@ -641,6 +683,32 @@ int main(int argc, char** argv) {
         std::cerr << ", Avg dist calcs=" << avg_dist_calcs;
     }
     std::cerr << "\n";
+    
+    // ==================== Export Visualization Files ====================
+    if (!args.vis_graph_path.empty()) {
+        std::cerr << "[VIS] Exporting graph structure to: " << args.vis_graph_path << "\n";
+        if (!solution.exportGraphForVisualization(args.vis_graph_path, args.vis_max_nodes)) {
+            std::cerr << "[VIS] Warning: Failed to export graph structure\n";
+        }
+    }
+    
+    if (!args.vis_paths_path.empty()) {
+        std::cerr << "[VIS] Exporting " << solution.getRecordedPathsCount() 
+                  << " search paths to: " << args.vis_paths_path << "\n";
+        if (!solution.exportSearchPaths(args.vis_paths_path)) {
+            std::cerr << "[VIS] Warning: Failed to export search paths\n";
+        }
+    }
+    
+    // ==================== Save Graph Cache (if cache-out specified) ====================
+    if (!args.cache_out.empty()) {
+        std::cerr << "[AblationRunner] Saving graph to cache: " << args.cache_out << "\n";
+        if (!solution.saveGraph(args.cache_out)) {
+            std::cerr << "[AblationRunner] Warning: Failed to save graph to cache\n";
+        } else {
+            std::cerr << "[AblationRunner] Graph saved to cache: " << args.cache_out << "\n";
+        }
+    }
     
     // ==================== Output JSON ====================
     output_json(args, build_ms, search_ms, qps, recall, avg_dist_calcs);
