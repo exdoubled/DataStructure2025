@@ -478,4 +478,21 @@ SOFTWARE.
 ## 数据集链接
 
 - **GloVe 数据集**：[Stanford NLP](https://nlp.stanford.edu/projects/glove/)
-- **SIFT 数据集**：[Corpus-Texmex](http://corpus-texmex.irisa.fr/)[an - NGT](https://github.com/yahoojapan/NGT)
+- **SIFT 数据集**：[Corpus-Texmex](http://corpus-texmex.irisa.fr/)
+
+## 图像结果
+
+[参数测试结果](https://tc-new.z.wiki/autoupload/4_V_ddXuVkoyJIUs82v1o1aMnouKReN3spbQz7x5YEI/20251223/aYFV/experiment_results.csv)
+
+[实验分析图像1](https://tc-new.z.wiki/autoupload/4_V_ddXuVkoyJIUs82v1o1aMnouKReN3spbQz7x5YEI/20251223/CEYl/output.zip)
+
+[实验分析图像2](https://tc-new.z.wiki/autoupload/4_V_ddXuVkoyJIUs82v1o1aMnouKReN3spbQz7x5YEI/20251223/r8Bo/output.z01)
+
+[实验分析图像3](https://tc-new.z.wiki/autoupload/4_V_ddXuVkoyJIUs82v1o1aMnouKReN3spbQz7x5YEI/20251223/uDsd/output.z02)
+
+[实验分析图像4](https://tc-new.z.wiki/autoupload/4_V_ddXuVkoyJIUs82v1o1aMnouKReN3spbQz7x5YEI/20251223/v7rS/output.z03)
+
+[实验分析图像5](https://tc-new.z.wiki/autoupload/4_V_ddXuVkoyJIUs82v1o1aMnouKReN3spbQz7x5YEI/20251223/gAyH/output.z04)
+
+[实验分析图像6](https://tc-new.z.wiki/autoupload/4_V_ddXuVkoyJIUs82v1o1aMnouKReN3spbQz7x5YEI/20251223/ZLKi/analysis_plots.zip)
+
